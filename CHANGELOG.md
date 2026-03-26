@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-26
+
+### Added
+
+- 게임 이름 hover 시 동영상/스크린샷 미리보기 팝업 (GameHoverPreview)
+- 게임 상세 페이지 동영상+스크린샷 통합 미디어 갤러리 (이전/다음 탐색)
+- HLS 스트리밍 동영상 재생 (hls.js, Safari 네이티브 HLS 지원)
+- 미디어 데이터 API 엔드포인트 (`/api/game/[appId]/media`)
+- 모바일 hover 비활성화 (`matchMedia` 체크)
+- 클라이언트 미디어 캐시 (재hover 시 API 재요청 방지)
+- 미디어 API 및 타입 검증 유닛 테스트 10건
+- README 한국어/영어 이중 언어 지원
+- Windows PowerShell 트러블슈팅 가이드 (README)
+
 ## [0.1.0] - 2026-03-26
 
 ### Added

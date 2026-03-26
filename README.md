@@ -1,5 +1,7 @@
 # Steam Review Feed
 
+[English](README.en.md) | **한국어**
+
 Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드에서 모아보는 서비스.
 
 ## 스크린샷
@@ -16,6 +18,7 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 - **다양한 필터** — 언어, 기간, 플레이타임, 글자수, 추천/비추천, 무료 게임 제외
 - **게임 검색** — 비로그인 상태에서도 게임 이름으로 검색 후 리뷰 조회
 - **게임별 리뷰** — 개별 게임 페이지에서 리뷰 상세 보기
+- **미디어 프리뷰** — 게임 이름 hover 시 동영상/스크린샷 팝업, 게임 상세 페이지 통합 미디어 갤러리
 
 ## 기술 스택
 
@@ -27,13 +30,14 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 | 세션 | iron-session (서명된 쿠키) |
 | 캐시 | lru-cache (인메모리) |
 | 인증 | Steam OpenID |
+| 동영상 | hls.js (HLS 스트리밍) |
 | 배포 | Docker (Nginx 리버스 프록시 설정 포함) |
 
 ## 프로젝트 구조
 
 ```
 ├── app/
-│   ├── api/           # API 라우트 (auth, cache, reviews, search, wishlist, library)
+│   ├── api/           # API 라우트 (auth, cache, reviews, search, wishlist, library, media)
 │   ├── feed/          # 통합 리뷰 피드 페이지
 │   ├── game/[appId]/  # 게임별 리뷰 페이지
 │   ├── privacy/       # 개인정보 처리방침
