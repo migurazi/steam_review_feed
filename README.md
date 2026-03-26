@@ -1,36 +1,109 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Steam Review Feed
 
-## Getting Started
+Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드에서 모아보는 서비스.
 
-First, run the development server:
+## 스크린샷
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+| 홈 화면 | 리뷰 피드 |
+|---------|-----------|
+| ![홈 화면](docs/screenshots/home.png) | ![리뷰 피드](docs/screenshots/feed.png) |
+
+## 주요 기능
+
+- **통합 리뷰 피드** — 위시리스트·라이브러리 게임의 최신 리뷰를 한 화면에서 확인
+- **Steam 로그인** — Steam OpenID 로그인 또는 Steam ID 직접 입력
+- **SSE 점진적 로딩** — 게임별 리뷰가 순차적으로 도착하는 실시간 스트리밍
+- **다양한 필터** — 언어, 기간, 플레이타임, 글자수, 추천/비추천, 무료 게임 제외
+- **게임 검색** — 비로그인 상태에서도 게임 이름으로 검색 후 리뷰 조회
+- **게임별 리뷰** — 개별 게임 페이지에서 리뷰 상세 보기
+
+## 기술 스택
+
+| 영역 | 기술 |
+|------|------|
+| 프레임워크 | Next.js 16 (App Router, TypeScript) |
+| 스타일링 | Tailwind CSS 4 |
+| DB | SQLite (better-sqlite3) — 사용자/게임 목록 영속화 |
+| 세션 | iron-session (서명된 쿠키) |
+| 캐시 | lru-cache (인메모리) |
+| 인증 | Steam OpenID |
+| 배포 | Docker (Nginx 리버스 프록시 설정 포함) |
+
+## 프로젝트 구조
+
+```
+├── app/
+│   ├── api/           # API 라우트 (auth, cache, reviews, search, wishlist, library)
+│   ├── feed/          # 통합 리뷰 피드 페이지
+│   ├── game/[appId]/  # 게임별 리뷰 페이지
+│   ├── privacy/       # 개인정보 처리방침
+│   ├── layout.tsx     # 루트 레이아웃
+│   └── page.tsx       # 홈 (로그인/검색)
+├── components/        # React 컴포넌트
+├── lib/               # 유틸리티 (캐시, DB, 세션, Rate Limit, Steam API)
+├── middleware.ts       # 인증 미들웨어
+├── docs/              # 기획 문서, 스크린샷
+├── __tests__/         # 테스트
+├── data/              # SQLite DB (gitignore)
+├── logs/              # 이벤트 로그 (gitignore)
+├── Dockerfile
+├── docker-compose.yml
+└── nginx.conf
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## 시작하기
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### 사전 요구사항
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- Node.js 20+
+- Steam Web API Key ([발급](https://steamcommunity.com/dev/apikey))
 
-## Learn More
+### 1. 환경 변수 설정
 
-To learn more about Next.js, take a look at the following resources:
+프로젝트 루트에 `.env.local` 파일을 생성합니다:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```env
+STEAM_API_KEY=발급받은_API_키
+SESSION_SECRET=32자_이상_랜덤_문자열
+NEXT_PUBLIC_BASE_URL=http://localhost:3000
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+> `STEAM_API_KEY`와 `SESSION_SECRET`은 필수입니다. 설정하지 않으면 서버가 시작되지 않습니다.
 
-## Deploy on Vercel
+### 2. 설치 및 실행
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+# 의존성 설치
+npm install
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+# 개발 서버
+npm run dev
+
+# 테스트
+npm test
+
+# 프로덕션 빌드 + 실행
+npm run build
+node .next/standalone/server.js
+```
+
+http://localhost:3000 에서 접속합니다.
+
+### 3. Docker 배포
+
+Docker 실행 전 환경변수를 설정합니다:
+
+```bash
+# .env 파일 생성 (docker-compose가 자동 로드)
+cp .env.local .env
+
+# 빌드 및 실행
+docker-compose up --build
+```
+
+`data/` 볼륨에 SQLite DB가 저장됩니다.
+Nginx 리버스 프록시가 필요하면 `docker-compose.yml`에서 nginx 서비스의 주석을 해제하세요.
+
+## 라이선스
+
+[MIT](LICENSE)

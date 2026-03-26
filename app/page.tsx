@@ -1,65 +1,148 @@
-import Image from "next/image";
+'use client';
+
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import SteamLoginButton from '@/components/SteamLoginButton';
+import GameSearch from '@/components/GameSearch';
 
 export default function Home() {
+  const [manualOpen, setManualOpen] = useState(false);
+  const [steamInput, setSteamInput] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [inputError, setInputError] = useState<string | null>(null);
+  const router = useRouter();
+
+  async function handleManualSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!steamInput.trim()) return;
+
+    setSubmitting(true);
+    setInputError(null);
+    try {
+      const res = await fetch('/api/auth/manual', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ steamId: steamInput.trim() }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        router.push('/feed');
+      } else {
+        setInputError(data.error ?? '로그인에 실패했습니다.');
+      }
+    } catch {
+      setInputError('요청 중 오류가 발생했습니다.');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <div className="min-h-screen bg-gray-900 text-gray-100 flex flex-col">
+      {/* Header */}
+      <header className="border-b border-gray-800 px-4 py-4">
+        <div className="max-w-5xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="text-[#66c0f4] font-bold text-lg">Steam Review Feed</span>
+          </div>
+          <a href="/privacy" className="text-gray-500 text-sm hover:text-gray-300 transition-colors">
+            개인정보 처리방침
+          </a>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+      </header>
+
+      {/* Hero */}
+      <main className="flex-1 flex flex-col items-center justify-center px-4 py-16">
+        <div className="w-full max-w-2xl space-y-10">
+          {/* Title */}
+          <div className="text-center space-y-3">
+            <h1 className="text-4xl font-bold text-white">
+              Steam Review Feed
+            </h1>
+            <p className="text-gray-400 text-lg">
+              위시리스트와 라이브러리 게임들의 최신 리뷰를 한 피드에서 모아보세요.
+            </p>
+            <ul className="flex flex-col sm:flex-row gap-2 justify-center text-sm text-gray-500 mt-4">
+              <li className="flex items-center gap-1">
+                <span className="text-[#66c0f4]">✓</span> 언어별 필터
+              </li>
+              <li className="flex items-center gap-1">
+                <span className="text-[#66c0f4]">✓</span> 플레이타임 맥락
+              </li>
+              <li className="flex items-center gap-1">
+                <span className="text-[#66c0f4]">✓</span> 실시간 스트리밍
+              </li>
+              <li className="flex items-center gap-1">
+                <span className="text-[#66c0f4]">✓</span> 기간/추천 필터
+              </li>
+            </ul>
+          </div>
+
+          {/* Login section */}
+          <div className="bg-gray-800 border border-gray-700 rounded-xl p-6 space-y-4">
+            <h2 className="text-gray-200 font-semibold text-base">시작하기</h2>
+            <p className="text-gray-400 text-sm">
+              위시리스트 / 라이브러리 기반 피드를 사용하려면 로그인이 필요합니다.
+            </p>
+
+            <div className="flex flex-col sm:flex-row gap-3">
+              <SteamLoginButton />
+              <button
+                type="button"
+                onClick={() => setManualOpen((o) => !o)}
+                className="px-4 py-3 rounded-lg border border-gray-600 text-gray-300 text-sm hover:border-gray-500 hover:text-gray-100 transition-colors"
+              >
+                Steam ID 직접 입력
+              </button>
+            </div>
+
+            {/* Manual login form */}
+            {manualOpen && (
+              <form onSubmit={handleManualSubmit} className="space-y-3 pt-2 border-t border-gray-700">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">
+                    Steam64 ID 또는 커스텀 URL (예: migurazi 또는 76561198XXXXXXXXX)
+                  </label>
+                  <input
+                    type="text"
+                    value={steamInput}
+                    onChange={(e) => setSteamInput(e.target.value)}
+                    placeholder="Steam ID 또는 커스텀 URL 입력"
+                    className="w-full px-3 py-2 bg-gray-900 border border-gray-600 rounded-lg text-gray-100 text-sm placeholder-gray-600 focus:outline-none focus:border-[#66c0f4] transition-colors"
+                  />
+                  {inputError && (
+                    <p className="text-red-400 text-xs mt-1">{inputError}</p>
+                  )}
+                </div>
+                <button
+                  type="submit"
+                  disabled={submitting || !steamInput.trim()}
+                  className="px-4 py-2 bg-[#1b2838] border border-[#4c6b8a] text-white text-sm rounded-lg hover:bg-[#2a475e] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {submitting ? '확인 중...' : '로그인'}
+                </button>
+              </form>
+            )}
+          </div>
+
+          {/* Game search (no login required) */}
+          <div className="space-y-3">
+            <h2 className="text-gray-300 font-medium text-sm">게임 검색 (비로그인 가능)</h2>
+            <GameSearch />
+            <p className="text-gray-600 text-xs">
+              특정 게임의 리뷰를 바로 확인할 수 있습니다.
+            </p>
+          </div>
         </div>
       </main>
+
+      {/* Footer */}
+      <footer className="border-t border-gray-800 px-4 py-4 text-center text-gray-600 text-xs">
+        Steam Review Feed — Steam과 무관한 비공식 서비스입니다.{' '}
+        <a href="/privacy" className="hover:text-gray-400 transition-colors underline">
+          개인정보 처리방침
+        </a>
+      </footer>
     </div>
   );
 }
