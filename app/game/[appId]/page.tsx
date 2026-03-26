@@ -5,7 +5,8 @@ import Link from 'next/link';
 import FilterPanel, { FilterState, DEFAULT_FILTERS } from '@/components/FilterPanel';
 import ReviewCard from '@/components/ReviewCard';
 import ProgressBar from '@/components/ProgressBar';
-import { GameReviewsEvent, ProgressEvent as ProgressEventData, SteamReview } from '@/lib/steam/types';
+import MediaPlayer from '@/components/MediaPlayer';
+import type { GameReviewsEvent, ProgressEvent as ProgressEventData, SteamReview, SteamMovie, SteamScreenshot } from '@/lib/steam/types';
 
 export default function GamePage({
   params,
@@ -21,14 +22,29 @@ export default function GamePage({
   });
   const [gameName, setGameName] = useState<string | null>(null);
 
+  /** 미디어 데이터 (동영상, 스크린샷, 헤더 이미지) */
+  const [media, setMedia] = useState<{
+    movies: SteamMovie[];
+    screenshots: SteamScreenshot[];
+    header_image: string;
+  } | null>(null);
+
   useEffect(() => {
     if (!appId) return;
+    // 게임 이름과 미디어 데이터를 병렬 fetch
     fetch(`/api/search?appId=${appId}`)
       .then((res) => res.json())
       .then((data) => {
         if (data.results?.[0]?.name) {
           setGameName(data.results[0].name);
         }
+      })
+      .catch(() => {});
+
+    fetch(`/api/game/${appId}/media`)
+      .then((res) => res.ok ? res.json() : null)
+      .then((data) => {
+        if (data) setMedia(data);
       })
       .catch(() => {});
   }, [appId]);
@@ -90,6 +106,18 @@ export default function GamePage({
             </svg>
           </a>
         </div>
+
+        {/* 미디어 섹션 — 동영상 또는 스크린샷 */}
+        {media && (
+          <div className="rounded-lg overflow-hidden border border-gray-700/50">
+            <MediaPlayer
+              movies={media.movies}
+              screenshots={media.screenshots}
+              headerImage={media.header_image}
+              variant="full"
+            />
+          </div>
+        )}
 
         {/* Filter panel (source hidden for single game view) */}
         <FilterPanel filters={filters} onChange={handleFilterChange} />

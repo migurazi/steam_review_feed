@@ -5,6 +5,7 @@ import { GameReviewsEvent, ProgressEvent as ProgressEventData, SteamReview } fro
 import { FilterState } from './FilterPanel';
 import ReviewCard from './ReviewCard';
 import ProgressBar from './ProgressBar';
+import GameHoverPreview from './GameHoverPreview';
 
 interface ReviewFeedProps {
   filters: FilterState;
@@ -215,13 +216,56 @@ export default function ReviewFeed({ filters, offset = 0 }: ReviewFeedProps) {
   );
 }
 
-/** 게임별 그룹 컴포넌트. 기본 축소 상태에서 첫 번째 리뷰만 표시. */
+/**
+ * 게임별 그룹 컴포넌트. 기본 축소 상태에서 첫 번째 리뷰만 표시.
+ * 게임 이름 hover 시 GameHoverPreview 팝업을 표시한다.
+ * 모바일(hover 미지원)에서는 hover preview 비활성화.
+ */
 function GameGroup({ item }: { item: FeedItem }) {
   const [expanded, setExpanded] = useState(false);
   const hasMore = item.reviews.length > 1;
   const visibleReviews = expanded ? item.reviews : item.reviews.slice(0, 1);
 
   const toggle = useCallback(() => setExpanded((e) => !e), []);
+
+  // --- hover preview 상태 ---
+  const [showPreview, setShowPreview] = useState(false);
+  const nameRef = useRef<HTMLAnchorElement>(null);
+  const hoverTimeout = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const closeTimeout = useRef<ReturnType<typeof setTimeout>>(undefined);
+  /** hover 장치 여부 (모바일 비활성화) */
+  const [canHover, setCanHover] = useState(false);
+
+  // matchMedia로 hover 지원 여부 감지 (CSR only)
+  useEffect(() => {
+    setCanHover(window.matchMedia('(hover: hover)').matches);
+  }, []);
+
+  // 500ms 후 팝업 열기 예약
+  const scheduleOpen = useCallback(() => {
+    if (!canHover) return;
+    clearTimeout(closeTimeout.current);
+    hoverTimeout.current = setTimeout(() => setShowPreview(true), 500);
+  }, [canHover]);
+
+  // 50ms delay로 팝업 닫기 예약 (anchor↔팝업 이동 시 깜빡임 방지)
+  const scheduleClose = useCallback(() => {
+    clearTimeout(hoverTimeout.current);
+    closeTimeout.current = setTimeout(() => setShowPreview(false), 50);
+  }, []);
+
+  // 팝업 hover 진입 시 닫기 취소
+  const cancelClose = useCallback(() => {
+    clearTimeout(closeTimeout.current);
+  }, []);
+
+  // cleanup: unmount 시 타이머 해제
+  useEffect(() => {
+    return () => {
+      clearTimeout(hoverTimeout.current);
+      clearTimeout(closeTimeout.current);
+    };
+  }, []);
 
   return (
     <div className="rounded-lg border border-gray-700/50 overflow-hidden">
@@ -238,8 +282,11 @@ function GameGroup({ item }: { item: FeedItem }) {
           <img src={item.gameIcon} alt="" className="w-8 h-8 rounded flex-shrink-0" />
         )}
         <a
+          ref={nameRef}
           href={`/game/${item.appId}`}
           onClick={(e) => e.stopPropagation()}
+          onMouseEnter={scheduleOpen}
+          onMouseLeave={scheduleClose}
           className="text-[#66c0f4] font-semibold hover:underline truncate"
         >
           {item.gameName}
@@ -299,6 +346,16 @@ function GameGroup({ item }: { item: FeedItem }) {
             ? '접기'
             : `나머지 ${item.reviews.length - 1}개 리뷰 더 보기`}
         </button>
+      )}
+
+      {/* Hover preview — Portal로 body에 렌더링 */}
+      {showPreview && nameRef.current && (
+        <GameHoverPreview
+          appId={item.appId}
+          anchorEl={nameRef.current}
+          onMouseEnter={cancelClose}
+          onMouseLeave={scheduleClose}
+        />
       )}
     </div>
   );

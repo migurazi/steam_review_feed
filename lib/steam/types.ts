@@ -52,6 +52,26 @@ export interface SteamRecentlyPlayedResponse {
 
 // --- store.steampowered.com/api/appdetails ---
 
+/** appdetails API의 동영상 항목. DASH/HLS 스트리밍 URL 제공. */
+export interface SteamMovie {
+  id: number;
+  name: string;
+  /** 동영상 썸네일 이미지 URL */
+  thumbnail: string;
+  /** HLS(H.264) 마스터 플레이리스트 URL (.m3u8) — hls.js로 재생 */
+  hls_h264: string;
+  highlight: boolean;
+}
+
+/** appdetails API의 스크린샷 항목. */
+export interface SteamScreenshot {
+  id: number;
+  /** 작은 이미지 (600x338) */
+  path_thumbnail: string;
+  /** 원본 이미지 (1920x1080) */
+  path_full: string;
+}
+
 export interface SteamAppDetails {
   name: string;
   steam_appid: number;
@@ -60,6 +80,8 @@ export interface SteamAppDetails {
   /** 짧은 설명 */
   short_description: string;
   type: string;
+  movies?: SteamMovie[];
+  screenshots?: SteamScreenshot[];
 }
 
 /**

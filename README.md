@@ -104,6 +104,33 @@ docker-compose up --build
 `data/` 볼륨에 SQLite DB가 저장됩니다.
 Nginx 리버스 프록시가 필요하면 `docker-compose.yml`에서 nginx 서비스의 주석을 해제하세요.
 
+## 트러블슈팅
+
+### Windows PowerShell에서 `npm` 실행 시 보안 오류
+
+```
+npm : 이 시스템에서 스크립트를 실행할 수 없으므로 ...
++ CategoryInfo : 보안 오류: (:) [], PSSecurityException
+```
+
+PowerShell 실행 정책이 스크립트 실행을 차단하는 경우입니다. 아래 방법 중 하나를 선택하세요:
+
+**방법 1 — 실행 정책 변경 (관리자 PowerShell에서 실행, 영구 적용)**
+```powershell
+Set-ExecutionPolicy RemoteSigned
+```
+
+**방법 2 — 현재 세션에서만 허용**
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+```
+
+**방법 3 — cmd에서 실행**
+```
+cmd
+npm install
+```
+
 ## 라이선스
 
 [MIT](LICENSE)
