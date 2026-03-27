@@ -60,7 +60,7 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 ### 사전 요구사항
 
 - Node.js 20+
-- Steam Web API Key ([발급](https://steamcommunity.com/dev/apikey))
+- Steam Web API Key ([여기서 발급받기](https://steamcommunity.com/dev/apikey))
 
 ### 1. 환경 변수 설정
 
