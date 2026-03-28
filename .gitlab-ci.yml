@@ -1,6 +1,5 @@
 stages:
   - build
-  - deploy
 
 variables:
   IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
@@ -23,51 +22,3 @@ build:
   only:
     - develop
     - main
-
-# 서버에 SSH로 배포
-deploy:
-  stage: deploy
-  image: alpine:latest
-  before_script:
-    - apk add --no-cache openssh-client
-    - eval $(ssh-agent -s)
-    - echo "$SSH_PRIVATE_KEY" | ssh-add -
-    - mkdir -p ~/.ssh
-    - echo "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
-  script:
-    - |
-      ssh $SSH_USER@$SSH_HOST << 'ENDSSH'
-        # GitLab Container Registry 로그인
-        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
-
-        # 배포 디렉토리 준비
-        mkdir -p ~/steam-review-feed/data ~/steam-review-feed/logs
-        cd ~/steam-review-feed
-
-        # 최신 이미지 pull & 재시작
-        docker pull $IMAGE_LATEST
-        docker stop steam-review-feed || true
-        docker rm steam-review-feed || true
-        docker run -d \
-          --name steam-review-feed \
-          --restart unless-stopped \
-          -p 3000:3000 \
-          -e STEAM_API_KEY="$STEAM_API_KEY" \
-          -e SESSION_SECRET="$SESSION_SECRET" \
-          -e NEXT_PUBLIC_BASE_URL="$NEXT_PUBLIC_BASE_URL" \
-          -e NODE_ENV=production \
-          -v ~/steam-review-feed/data:/app/data \
-          -v ~/steam-review-feed/logs:/app/logs \
-          --memory=512m \
-          $IMAGE_LATEST
-
-        # 미사용 이미지 정리
-        docker image prune -f
-      ENDSSH
-  only:
-    - develop
-    - main
-  when: manual
-  environment:
-    name: production
-    url: $NEXT_PUBLIC_BASE_URL
