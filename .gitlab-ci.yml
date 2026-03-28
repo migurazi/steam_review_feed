@@ -1,5 +1,6 @@
 stages:
   - build
+  - release
 
 variables:
   IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
@@ -19,5 +20,18 @@ build:
     - docker build -t $IMAGE_TAG -t $IMAGE_LATEST .
     - docker push $IMAGE_TAG
     - docker push $IMAGE_LATEST
+  only:
+    - tags
+
+# GitLab Release 생성
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - echo "Creating release for $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "Release $CI_COMMIT_TAG"
+    description: "Docker image: $IMAGE_TAG"
   only:
     - tags
