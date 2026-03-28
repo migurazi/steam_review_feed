@@ -3,6 +3,9 @@
  * POST /api/cache/invalidate?key=wishlist:76561198056932899
  *
  * "새로고침" 버튼에서 호출. 지정된 캐시 키를 삭제한다.
+ *
+ * 보안: 자신의 steamId가 포함된 키만 무효화 가능.
+ * 와일드카드: key 끝이 "*"이면 해당 prefix의 모든 키를 삭제한다.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -30,17 +33,21 @@ export async function POST(request: NextRequest) {
   ];
   const isAllowed = allowedPrefixes.some((prefix) => key.startsWith(prefix));
 
-  if (isAllowed) {
-    if (key.includes("*")) {
-      cacheDeleteByPrefix(key.replace("*", ""));
-    } else {
-      cacheDelete(key);
-    }
-    return NextResponse.json({ success: true, key });
+  if (!isAllowed) {
+    return NextResponse.json(
+      { error: "본인의 캐시만 무효화할 수 있습니다." },
+      { status: 403 }
+    );
   }
 
-  return NextResponse.json(
-    { error: "본인의 캐시만 무효화할 수 있습니다." },
-    { status: 403 }
-  );
+  // 와일드카드 처리: 끝이 "*"이면 prefix 삭제, 아니면 정확한 키 삭제
+  if (key.endsWith("*")) {
+    // "*" 제거하여 prefix 추출 (replaceAll이 아닌 slice로 마지막 문자만 제거)
+    const prefix = key.slice(0, -1);
+    cacheDeleteByPrefix(prefix);
+  } else {
+    cacheDelete(key);
+  }
+
+  return NextResponse.json({ success: true, key });
 }

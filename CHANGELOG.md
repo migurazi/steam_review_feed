@@ -5,7 +5,48 @@
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-03-26
+## [0.3.0] - 2026-03-28
+
+### Added
+
+- **Light/Dark 테마** — 시스템 설정 자동 감지 + 수동 토글 (light/dark/system)
+  - ThemeProvider (`useSyncExternalStore` 기반, localStorage 저장)
+  - ThemeToggle 컴포넌트 (태양/달/모니터 아이콘 순환)
+  - FOUC 방지 인라인 스크립트 (`layout.tsx <head>`)
+  - 전체 11개 UI 파일에 Tailwind `dark:` variant 적용
+- **hover 미디어 갤러리 탐색** — compact 모드에서도 이전/다음 버튼으로 동영상+스크린샷 탐색
+- **GitLab CI/CD** — `.gitlab-ci.yml` (Docker 빌드 -> Registry push -> SSH 배포)
+- **환경변수 검증** — 서버 시작 시 필수 환경변수 누락 조기 감지 (`lib/env.ts`)
+- **서버 초기화 모듈** — `lib/init.ts` (env 검증 + DB 정리 스케줄러 통합)
+- **전역 상수 모듈** — `lib/constants.ts` (PAGE_SIZE, RATE_LIMIT, SESSION_COOKIE_NAME 등)
+- **정렬/필터 유틸리티 분리** — `lib/steam/sort.ts`, `lib/steam/filters.ts`
+- **단위 테스트 대폭 추가** — 20개 -> 77개
+  - env (환경변수 검증), constants (상수 값), db (CRUD, 싱글톤)
+  - logger (JSONL 기록), sort (엣지 케이스), filters (경계값, 유니코드)
+- **npm 스크립트** — `start:standalone`, `postbuild` (정적 파일 자동 복사)
+
+### Changed
+
+- **SSE 스트리밍 병렬화** — 순차 -> 3개씩 배치 병렬 (`Promise.allSettled` + `STREAM_CONCURRENCY`)
+- **중복 API 호출 제거** — `checkIsFree` + `getAppDetails` -> `getAppInfo` 통합
+- **DB 사이드이펙트 제거** — 모듈 import만으로 스케줄러 시작되던 문제 해결
+- **로거 완전 비동기화** — `fs.existsSync` (동기) -> `fs.promises.mkdir` (비동기)
+- **Steam API 에러 상세화** — 429/403/5xx 상태별 경고 메시지 구분
+- **OpenID 콜백 URL 교정** — standalone 모드 origin 불일치 시 baseUrl 기준 교정
+- **SESSION_COOKIE_NAME 일원화** — middleware/session 중복 정의 -> `lib/constants.ts`
+- **TextEncoder 재사용** — SSE 이벤트 인코딩 시 모듈 레벨 싱글톤
+- **MediaPlayer 간소화** — full/compact 분기 제거, 단일 `MediaGallery` 호출
+- **ESLint no-img-element** — 개별 disable 주석 10개 -> eslint.config에서 전역 off
+
+### Fixed
+
+- **캐시 무효화 와일드카드 버그** — `replace("*","")` -> `slice(0,-1)`
+- **HTML 스펙 위반** — `<button>` 안의 `<a>` 중첩 -> `<div role="button">`
+- **standalone CSS 미적용** — postbuild 스크립트로 정적 파일 자동 복사
+- **standalone 환경변수 미로드** — `--env-file` 가이드 및 npm script 추가
+- **ESLint 경고 전수 해결** — `void e`, `set-state-in-effect`, `refs-during-render`
+
+## [0.2.0] - 2026-03-27
 
 ### Added
 

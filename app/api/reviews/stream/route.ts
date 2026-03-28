@@ -2,10 +2,15 @@
  * SSE 리뷰 스트리밍 엔드포인트.
  * GET /api/reviews/stream?source=wishlist&language=koreana&...
  *
- * 게임 목록을 가져와 게임별로 순차적으로 리뷰를 수집하고,
+ * 게임 목록을 가져와 게임별로 리뷰를 수집하고,
  * SSE(Server-Sent Events)로 클라이언트에 점진적으로 전송한다.
  *
  * 기획서 5.4절(점진적 로딩)과 7.2절(리뷰 수집 로직) 구현.
+ *
+ * 성능 최적화:
+ *   - STREAM_CONCURRENCY개의 게임을 동시에 병렬 처리한다.
+ *   - checkIsFree + getAppDetails 중복 호출을 제거하여 불필요한 딜레이를 방지한다.
+ *   - 클라이언트 연결 끊김 시 즉시 남은 작업을 취소한다.
  */
 
 import { NextRequest } from "next/server";
@@ -19,6 +24,15 @@ import {
 import { cacheGet } from "@/lib/cache";
 import { logEvent } from "@/lib/logger";
 import { rateLimitResponse } from "@/lib/rate-limit";
+import {
+  PAGE_SIZE,
+  MAX_REVIEWS_PER_GAME,
+  REVIEW_RETRY_THRESHOLD,
+  STREAM_CONCURRENCY,
+  DEFAULT_FILTER_VALUES,
+} from "@/lib/constants";
+import { sortLibraryGames } from "@/lib/steam/sort";
+import { applyPostFilters } from "@/lib/steam/filters";
 import type {
   SteamWishlistItem,
   SteamOwnedGame,
@@ -28,34 +42,19 @@ import type {
 
 export const dynamic = "force-dynamic";
 
-// --- 필터 기본값 (기획서 5.2절) ---
-const DEFAULTS = {
-  source: "wishlist" as const,
-  language: "koreana",
-  minPlaytime: 0,
-  minLength: 0,
-  reviewType: "all" as const,
-  dayRange: 30,
-  excludeFree: true,
-  offset: 0,
-};
-
-const PAGE_SIZE = 50;
-const MAX_REVIEWS_PER_GAME = 20;
-
 /** 쿼리 파라미터를 파싱하여 필터 설정을 반환한다. */
 function parseFilters(params: URLSearchParams) {
   return {
     /** 단일 게임 조회 모드. 지정 시 source 무시하고 이 게임만 조회. */
     appId: params.get("appId") || null,
-    source: (params.get("source") || DEFAULTS.source) as
+    source: (params.get("source") || DEFAULT_FILTER_VALUES.source) as
       | "wishlist"
       | "library"
       | "both",
-    language: params.get("language") || DEFAULTS.language,
+    language: params.get("language") || DEFAULT_FILTER_VALUES.language,
     minPlaytime: parseInt(params.get("minPlaytime") || "0", 10),
     minLength: parseInt(params.get("minLength") || "0", 10),
-    reviewType: (params.get("reviewType") || DEFAULTS.reviewType) as
+    reviewType: (params.get("reviewType") || DEFAULT_FILTER_VALUES.reviewType) as
       | "all"
       | "positive"
       | "negative",
@@ -65,57 +64,31 @@ function parseFilters(params: URLSearchParams) {
   };
 }
 
+/** 모듈 레벨 TextEncoder (매 호출마다 생성하지 않고 재사용) */
+const encoder = new TextEncoder();
+
 /** SSE 이벤트를 TextEncoder로 인코딩한다. */
 function sseEvent(event: string, data: unknown): Uint8Array {
-  const encoder = new TextEncoder();
   return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 /**
- * 서버 후처리 필터: 리뷰 배열에 minPlaytime, minLength, reviewType 적용.
- * Steam API의 language, day_range는 서버 사이드에서 이미 적용됨.
- */
-function applyPostFilters(
-  reviews: SteamReview[],
-  filters: { minPlaytime: number; minLength: number; reviewType: string }
-): SteamReview[] {
-  return reviews.filter((r) => {
-    // 최소 플레이타임 (시간 → 분 변환)
-    if (
-      filters.minPlaytime > 0 &&
-      r.author.playtime_at_review < filters.minPlaytime * 60
-    ) {
-      return false;
-    }
-
-    // 최소 글자수
-    if (filters.minLength > 0 && r.review.length < filters.minLength) {
-      return false;
-    }
-
-    // 추천/비추천 필터
-    if (filters.reviewType === "positive" && !r.voted_up) return false;
-    if (filters.reviewType === "negative" && r.voted_up) return false;
-
-    return true;
-  });
-}
-
-/**
- * 게임이 무료인지 확인한다.
- * 캐시에 is_free 정보가 있으면 사용, 없으면 appdetails 호출.
+ * 게임의 상세 정보(이름, 아이콘, 무료 여부)를 한 번의 API 호출로 가져온다.
+ * 캐시 히트 시 API 호출 없이 즉시 반환한다.
  *
- * @returns true=무료, false=유료, null=확인 불가(API 실패)
+ * 기존 checkIsFree + getAppDetails 중복 호출 문제를 해결한다.
+ *
+ * @param appId Steam App ID
+ * @returns 앱 상세 정보. 실패 시 null.
  */
-async function checkIsFree(appId: number): Promise<boolean | null> {
+async function getAppInfo(appId: number): Promise<SteamAppDetails | null> {
   // 캐시에서 먼저 확인
   const cached = cacheGet<SteamAppDetails>(`app:${appId}:info`);
-  if (cached) return cached.data.is_free;
+  if (cached) return cached.data;
 
-  // 캐시 미스: appdetails 호출 (1초 딜레이 포함)
+  // 캐시 미스: appdetails 호출 (딜레이 포함)
   const details = await getAppDetails(appId);
-  if (!details) return null;
-  return details.data.is_free;
+  return details?.data ?? null;
 }
 
 export async function GET(request: NextRequest) {
@@ -139,7 +112,6 @@ export async function GET(request: NextRequest) {
   });
 
   // ReadableStream으로 SSE 스트림 생성
-  // 클라이언트가 연결을 끊으면 cancelled=true가 되어 enqueue를 중단한다.
   let cancelled = false;
   const stream = new ReadableStream({
     async start(controller) {
@@ -174,19 +146,30 @@ export async function GET(request: NextRequest) {
   });
 }
 
-/** 메인 스트리밍 로직: 게임 목록 → 게임별 리뷰 수집 → SSE 전송 */
+/**
+ * 메인 스트리밍 로직.
+ *
+ * 1. 게임 목록 수집 (위시리스트/라이브러리/both)
+ * 2. STREAM_CONCURRENCY개씩 병렬로 리뷰 수집
+ * 3. 각 게임의 결과를 SSE로 클라이언트에 전송
+ *
+ * @param controller ReadableStream 컨트롤러
+ * @param steamId 로그인한 사용자의 Steam64 ID
+ * @param filters 파싱된 필터 설정
+ * @param isCancelled 클라이언트 연결 끊김 확인 함수
+ */
 async function streamReviews(
   controller: ReadableStreamDefaultController,
   steamId: string,
   filters: ReturnType<typeof parseFilters>,
   isCancelled: () => boolean = () => false
 ) {
-  // 단일 게임 모드: appId가 지정되면 해당 게임만 조회
+  // --- 단일 게임 모드: appId가 지정되면 해당 게임만 조회 ---
   if (filters.appId) {
     const appIdNum = parseInt(filters.appId, 10);
-    const details = await getAppDetails(appIdNum);
-    const gameName = details?.data.name || `AppID ${filters.appId}`;
-    const gameIcon = details?.data.header_image || "";
+    const details = await getAppInfo(appIdNum);
+    const gameName = details?.name || `AppID ${filters.appId}`;
+    const gameIcon = details?.header_image || "";
 
     const reviewResult = await getReviews(
       appIdNum,
@@ -218,7 +201,9 @@ async function streamReviews(
     return;
   }
 
-  // 1. 게임 목록 수집 (소스에 따라)
+  // --- 피드 모드: 게임 목록을 수집하고 병렬로 리뷰 수집 ---
+
+  // 1. 게임 목록 수집
   const games = await collectGameList(steamId, filters);
   if (games.length === 0) {
     controller.enqueue(sseEvent("done", { totalGames: 0, totalReviews: 0 }));
@@ -229,90 +214,40 @@ async function streamReviews(
   let loaded = 0;
   let totalReviews = 0;
 
-  // 2. 게임별 순차 처리
-  for (const game of games) {
-    // 클라이언트가 연결을 끊었으면 중단
+  // 2. STREAM_CONCURRENCY개씩 배치 병렬 처리
+  //    각 배치 내의 게임들은 동시에 처리되어 대기 시간을 대폭 줄인다.
+  for (let i = 0; i < games.length; i += STREAM_CONCURRENCY) {
     if (isCancelled()) return;
-    loaded++;
 
-    // 무료 게임 제외 필터
-    if (filters.excludeFree) {
-      // 라이브러리 게임은 캐시 히트일 때만 사전 필터, 아니면 appdetails 호출
-      const isFree = await checkIsFree(game.appId);
-      if (isFree === true) {
-        controller.enqueue(sseEvent("progress", { loaded, total }));
-        continue;
-      }
-      // isFree === null (API 실패)이면 건너뛰지 않고 리뷰 조회 시도
-    }
+    const batch = games.slice(i, i + STREAM_CONCURRENCY);
 
-    // 게임 이름/아이콘 확보
-    let gameName = game.name || `AppID ${game.appId}`;
-    let gameIcon = game.icon || "";
-
-    // 위시리스트 게임은 이름이 없으므로 appdetails에서 가져옴
-    if (!game.name) {
-      const cached = cacheGet<SteamAppDetails>(`app:${game.appId}:info`);
-      if (cached) {
-        gameName = cached.data.name;
-        gameIcon = cached.data.header_image;
-      } else {
-        // 이미 checkIsFree에서 appdetails를 호출했을 수 있음
-        const details = await getAppDetails(game.appId);
-        if (details) {
-          gameName = details.data.name;
-          gameIcon = details.data.header_image;
-        }
-      }
-    }
-
-    // 리뷰 조회
-    const reviewResult = await getReviews(
-      game.appId,
-      filters.language,
-      10,
-      filters.dayRange
+    // 배치 내 게임들을 병렬 처리
+    const results = await Promise.allSettled(
+      batch.map((game) => processGame(game, filters, isCancelled))
     );
 
-    let reviews: SteamReview[] = reviewResult?.data ?? [];
-    let noReviewsInLanguage = false;
+    // 각 결과를 순차적으로 SSE 전송 (순서 보장)
+    for (const result of results) {
+      if (isCancelled()) return;
+      loaded++;
 
-    if (reviews.length > 0) {
-      // 서버 후처리 필터 적용
-      reviews = applyPostFilters(reviews, filters);
+      if (result.status === "fulfilled" && result.value) {
+        const { appId, gameName, gameIcon, reviews, noReviewsInLanguage } = result.value;
+        totalReviews += reviews.length;
 
-      // 필터 후 2개 미만 → 20개로 재요청 (1회만, 최대 20개 상한)
-      if (reviews.length < 2) {
-        const retryResult = await getReviews(
-          game.appId,
-          filters.language,
-          MAX_REVIEWS_PER_GAME,
-          filters.dayRange
+        controller.enqueue(
+          sseEvent("game-reviews", {
+            appId,
+            gameName,
+            gameIcon,
+            reviews,
+            noReviewsInLanguage,
+          })
         );
-        if (retryResult) {
-          reviews = applyPostFilters(retryResult.data, filters);
-        }
       }
-    } else {
-      // 해당 언어 리뷰가 0건
-      noReviewsInLanguage = true;
+
+      controller.enqueue(sseEvent("progress", { loaded, total }));
     }
-
-    totalReviews += reviews.length;
-
-    // SSE 이벤트 전송
-    controller.enqueue(
-      sseEvent("game-reviews", {
-        appId: game.appId,
-        gameName,
-        gameIcon,
-        reviews,
-        noReviewsInLanguage,
-      })
-    );
-
-    // 진행 상태
-    controller.enqueue(sseEvent("progress", { loaded, total }));
   }
 
   // 3. 완료
@@ -321,17 +256,105 @@ async function streamReviews(
   );
 }
 
+/**
+ * 단일 게임의 리뷰를 수집하는 처리 단위.
+ * 병렬 실행을 위해 독립적으로 동작한다.
+ *
+ * 처리 순서:
+ * 1. 무료 게임 필터 (excludeFree)
+ * 2. 게임 이름/아이콘 확보 (getAppInfo 통합)
+ * 3. 리뷰 조회 + 후처리 필터
+ * 4. 필터 후 부족하면 재요청 (1회)
+ *
+ * @returns 게임별 리뷰 데이터. 건너뛰어야 할 경우 null.
+ */
+async function processGame(
+  game: GameEntry,
+  filters: ReturnType<typeof parseFilters>,
+  isCancelled: () => boolean
+): Promise<{
+  appId: number;
+  gameName: string;
+  gameIcon: string;
+  reviews: SteamReview[];
+  noReviewsInLanguage: boolean;
+} | null> {
+  if (isCancelled()) return null;
+
+  // 앱 정보를 한 번만 가져온다 (무료 여부 + 이름/아이콘)
+  const appInfo = game.name ? null : await getAppInfo(game.appId);
+
+  // 무료 게임 제외 필터
+  if (filters.excludeFree) {
+    const isFree = game.name
+      ? (cacheGet<SteamAppDetails>(`app:${game.appId}:info`)?.data?.is_free ?? null)
+      : (appInfo?.is_free ?? null);
+
+    if (isFree === true) return null;
+    // isFree === null (API 실패)이면 건너뛰지 않고 리뷰 조회 시도
+  }
+
+  // 게임 이름/아이콘 확보
+  const gameName = game.name || appInfo?.name || `AppID ${game.appId}`;
+  const gameIcon = game.icon || appInfo?.header_image || "";
+
+  if (isCancelled()) return null;
+
+  // 리뷰 조회
+  const reviewResult = await getReviews(
+    game.appId,
+    filters.language,
+    10,
+    filters.dayRange
+  );
+
+  let reviews: SteamReview[] = reviewResult?.data ?? [];
+  let noReviewsInLanguage = false;
+
+  if (reviews.length > 0) {
+    // 서버 후처리 필터 적용
+    reviews = applyPostFilters(reviews, filters);
+
+    // 필터 후 부족하면 더 많은 리뷰로 재요청 (1회만)
+    if (reviews.length < REVIEW_RETRY_THRESHOLD) {
+      const retryResult = await getReviews(
+        game.appId,
+        filters.language,
+        MAX_REVIEWS_PER_GAME,
+        filters.dayRange
+      );
+      if (retryResult) {
+        reviews = applyPostFilters(retryResult.data, filters);
+      }
+    }
+  } else {
+    noReviewsInLanguage = true;
+  }
+
+  return { appId: game.appId, gameName, gameIcon, reviews, noReviewsInLanguage };
+}
+
+// --- 게임 목록 수집 ---
+
 /** 통합 게임 정보 (위시리스트와 라이브러리를 통일된 형태로) */
 interface GameEntry {
   appId: number;
-  name?: string; // 라이브러리만 name 포함
-  icon?: string; // 라이브러리만 icon 포함
+  /** 라이브러리 게임만 name 포함. 위시리스트 게임은 undefined. */
+  name?: string;
+  /** 라이브러리 게임만 icon URL 포함. */
+  icon?: string;
 }
 
 /**
  * 소스(위시리스트/라이브러리/both)에 따라 게임 목록을 수집한다.
- * 사전 필터링: 캐시에 is_free=true인 게임만 제외.
- * 정렬 및 상한(50개) 적용.
+ * 정렬 및 상한(PAGE_SIZE개) 적용.
+ *
+ * 위시리스트: date_added 최신순 정렬
+ * 라이브러리: 최근 2주 플레이 > 총 플레이타임 순 정렬
+ *
+ * @param steamId 사용자 Steam64 ID
+ * @param filters 파싱된 필터 (source, offset 사용)
+ * @returns 통합 게임 목록
  */
 async function collectGameList(
   steamId: string,
@@ -339,9 +362,9 @@ async function collectGameList(
 ): Promise<GameEntry[]> {
   const games: GameEntry[] = [];
 
-  // source=both인 경우 각 소스 25개씩
+  // source=both인 경우 각 소스 25개씩 (총 50개)
   const limitPerSource =
-    filters.source === "both" ? PAGE_SIZE / 2 : PAGE_SIZE;
+    filters.source === "both" ? Math.floor(PAGE_SIZE / 2) : PAGE_SIZE;
 
   if (filters.source === "wishlist" || filters.source === "both") {
     const result = await getWishlist(steamId);
@@ -363,14 +386,7 @@ async function collectGameList(
   if (filters.source === "library" || filters.source === "both") {
     const result = await getOwnedGames(steamId);
     if (result) {
-      const sorted = [...result.data].sort((a, b) => {
-        const aRecent = a.playtime_2weeks ?? 0;
-        const bRecent = b.playtime_2weeks ?? 0;
-        if (aRecent > 0 && bRecent === 0) return -1;
-        if (aRecent === 0 && bRecent > 0) return 1;
-        if (aRecent > 0 && bRecent > 0) return bRecent - aRecent;
-        return b.playtime_forever - a.playtime_forever;
-      });
+      const sorted = sortLibraryGames(result.data);
       const sliced = sorted.slice(filters.offset, filters.offset + limitPerSource);
       games.push(
         ...sliced.map(
@@ -388,3 +404,4 @@ async function collectGameList(
 
   return games;
 }
+

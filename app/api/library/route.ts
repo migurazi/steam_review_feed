@@ -3,16 +3,16 @@
  * GET /api/library?offset=0
  *
  * 세션의 steamId로 GetOwnedGames 호출 (캐시 우선).
- * 정렬: playtime_2weeks > 0인 게임 우선 → playtime_forever 높은 순.
- * 50개 상한, offset으로 페이지네이션.
+ * 정렬: playtime_2weeks > 0인 게임 우선 -> playtime_forever 높은 순.
+ * PAGE_SIZE개 상한, offset으로 페이지네이션.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { getSession } from "@/lib/session";
 import { getOwnedGames } from "@/lib/steam/api";
 import { rateLimitResponse } from "@/lib/rate-limit";
-
-const PAGE_SIZE = 50;
+import { sortLibraryGames } from "@/lib/steam/sort";
+import { PAGE_SIZE } from "@/lib/constants";
 
 export async function GET(request: NextRequest) {
   const limited = rateLimitResponse(request);
@@ -33,21 +33,8 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  // 정렬: 최근 2주 플레이 게임 우선 → 총 플레이타임 높은 순
-  const sorted = [...result.data].sort((a, b) => {
-    const aRecent = a.playtime_2weeks ?? 0;
-    const bRecent = b.playtime_2weeks ?? 0;
-
-    // 최근 2주 플레이가 있는 게임 우선
-    if (aRecent > 0 && bRecent === 0) return -1;
-    if (aRecent === 0 && bRecent > 0) return 1;
-
-    // 둘 다 최근 플레이가 있으면 최근 플레이타임 순
-    if (aRecent > 0 && bRecent > 0) return bRecent - aRecent;
-
-    // 둘 다 없으면 총 플레이타임 순
-    return b.playtime_forever - a.playtime_forever;
-  });
+  // 정렬: 최근 2주 플레이 게임 우선 -> 총 플레이타임 높은 순
+  const sorted = sortLibraryGames(result.data);
 
   // 페이지네이션
   const page = sorted.slice(offset, offset + PAGE_SIZE);

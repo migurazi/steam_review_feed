@@ -59,9 +59,12 @@ export async function verifyCallback(
   realm: string
 ): Promise<string | null> {
   return new Promise((resolve) => {
-    // returnUrl은 콜백 URL의 경로 부분 (쿼리 제외)
-    const url = new URL(callbackUrl);
-    const returnUrl = `${url.origin}${url.pathname}`;
+    // returnUrl은 realm(baseUrl) 기준으로 구성한다.
+    // standalone 모드에서 request.url의 origin이 다를 수 있으므로
+    // 항상 realm의 origin을 사용하여 openid 라이브러리의 "Invalid return URL" 방지.
+    const callbackPath = new URL(callbackUrl).pathname;
+    const realmOrigin = new URL(realm).origin;
+    const returnUrl = `${realmOrigin}${callbackPath}`;
     const rp = createRelyingParty(returnUrl, realm);
 
     rp.verifyAssertion(callbackUrl, (err: unknown, result?: { authenticated: boolean; claimedIdentifier?: string }) => {

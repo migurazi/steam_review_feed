@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { GameReviewsEvent, ProgressEvent as ProgressEventData, SteamReview } from '@/lib/steam/types';
 import { FilterState } from './FilterPanel';
 import ReviewCard from './ReviewCard';
@@ -44,17 +44,8 @@ export default function ReviewFeed({ filters, offset = 0 }: ReviewFeedProps) {
   const esRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
-    // Close existing connection
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
-
-    setItems([]);
-    setProgress(null);
-    setLoading(true);
-    setError(null);
-    setDone(false);
+    // 이 컴포넌트는 key={JSON.stringify(filters)}로 리마운트되므로
+    // 상태는 이미 초기값이다. 명시적 리셋은 불필요.
     doneRef.current = false;
 
     const url = buildStreamUrl(filters, offset);
@@ -88,31 +79,26 @@ export default function ReviewFeed({ filters, offset = 0 }: ReviewFeedProps) {
       }
     });
 
-    es.addEventListener('done', (e: MessageEvent) => {
-      try {
-        // Sort all reviews by timestamp_created descending after done
-        setItems((prev) => {
-          const sorted = [...prev].map((item) => ({
-            ...item,
-            reviews: [...item.reviews].sort((a, b) => b.timestamp_created - a.timestamp_created),
-          }));
-          // Also sort items by most recent review
-          sorted.sort((a, b) => {
-            const aMax = a.reviews.length > 0 ? a.reviews[0].timestamp_created : 0;
-            const bMax = b.reviews.length > 0 ? b.reviews[0].timestamp_created : 0;
-            return bMax - aMax;
-          });
-          return sorted;
+    es.addEventListener('done', () => {
+      // 전체 로딩 완료 후 리뷰를 시간순으로 정렬
+      setItems((prev) => {
+        const sorted = [...prev].map((item) => ({
+          ...item,
+          reviews: [...item.reviews].sort((a, b) => b.timestamp_created - a.timestamp_created),
+        }));
+        // 게임별로도 최신 리뷰 기준으로 정렬
+        sorted.sort((a, b) => {
+          const aMax = a.reviews.length > 0 ? a.reviews[0].timestamp_created : 0;
+          const bMax = b.reviews.length > 0 ? b.reviews[0].timestamp_created : 0;
+          return bMax - aMax;
         });
-      } catch {
-        // ignore
-      }
+        return sorted;
+      });
       setLoading(false);
       setDone(true);
       doneRef.current = true;
       es.close();
       esRef.current = null;
-      void e; // suppress unused warning
     });
 
     es.addEventListener('error', (e: MessageEvent) => {
@@ -163,31 +149,30 @@ export default function ReviewFeed({ filters, offset = 0 }: ReviewFeedProps) {
       )}
 
       {loading && !progress && (
-        <div className="flex items-center gap-3 text-gray-400 text-sm py-4">
-          <div className="w-4 h-4 border-2 border-[#66c0f4] border-t-transparent rounded-full animate-spin flex-shrink-0" />
+        <div className="flex items-center gap-3 text-gray-500 dark:text-gray-400 text-sm py-4">
+          <div className="w-4 h-4 border-2 border-[#1b6fa8] dark:border-[#66c0f4] border-t-transparent rounded-full animate-spin flex-shrink-0" />
           리뷰를 불러오는 중...
         </div>
       )}
 
       {/* Error */}
       {error && (
-        <div className="bg-red-900/40 border border-red-700 rounded-lg px-4 py-3 text-red-300 text-sm">
+        <div className="bg-red-50 dark:bg-red-900/40 border border-red-200 dark:border-red-700 rounded-lg px-4 py-3 text-red-600 dark:text-red-300 text-sm">
           {error}
         </div>
       )}
 
       {/* No Korean review games */}
       {noKoreanGames.length > 0 && (
-        <div className="bg-gray-800/60 border border-gray-700 rounded-lg px-4 py-3">
-          <p className="text-gray-400 text-xs mb-2">한국어 리뷰 없음:</p>
+        <div className="bg-gray-100 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-3">
+          <p className="text-gray-500 dark:text-gray-400 text-xs mb-2">한국어 리뷰 없음:</p>
           <div className="flex flex-wrap gap-2">
             {noKoreanGames.map((item) => (
               <span
                 key={item.appId}
-                className="inline-flex items-center gap-1 px-2 py-1 bg-gray-700 rounded text-xs text-gray-300"
+                className="inline-flex items-center gap-1 px-2 py-1 bg-gray-200 dark:bg-gray-700 rounded text-xs text-gray-600 dark:text-gray-300"
               >
                 {item.gameIcon && (
-                  // eslint-disable-next-line @next/next/no-img-element
                   <img src={item.gameIcon} alt="" className="w-4 h-4 rounded" />
                 )}
                 {item.gameName}
@@ -230,16 +215,16 @@ function GameGroup({ item }: { item: FeedItem }) {
 
   // --- hover preview 상태 ---
   const [showPreview, setShowPreview] = useState(false);
-  const nameRef = useRef<HTMLAnchorElement>(null);
+  // callback ref 패턴으로 렌더 중 ref 접근 lint 에러를 방지
+  const [nameEl, setNameEl] = useState<HTMLAnchorElement | null>(null);
   const hoverTimeout = useRef<ReturnType<typeof setTimeout>>(undefined);
   const closeTimeout = useRef<ReturnType<typeof setTimeout>>(undefined);
-  /** hover 장치 여부 (모바일 비활성화) */
-  const [canHover, setCanHover] = useState(false);
-
-  // matchMedia로 hover 지원 여부 감지 (CSR only)
-  useEffect(() => {
-    setCanHover(window.matchMedia('(hover: hover)').matches);
-  }, []);
+  /** hover 장치 여부 (모바일 비활성화). SSR-safe한 useSyncExternalStore 사용. */
+  const canHover = useSyncExternalStore(
+    () => () => {}, // hover 미디어 쿼리는 변경되지 않으므로 subscribe는 no-op
+    () => window.matchMedia('(hover: hover)').matches, // client snapshot
+    () => false // server snapshot (SSR에서는 hover 없음)
+  );
 
   // 500ms 후 팝업 열기 예약
   const scheduleOpen = useCallback(() => {
@@ -268,26 +253,27 @@ function GameGroup({ item }: { item: FeedItem }) {
   }, []);
 
   return (
-    <div className="rounded-lg border border-gray-700/50 overflow-hidden">
-      {/* 게임 헤더 — 클릭으로 expand/shrink */}
-      <button
-        type="button"
+    <div className="rounded-lg border border-gray-200 dark:border-gray-700/50 overflow-hidden">
+      {/* 게임 헤더 — div로 변경하여 a 태그 중첩 방지 (HTML 스펙 준수) */}
+      <div
+        role={hasMore ? "button" : undefined}
+        tabIndex={hasMore ? 0 : undefined}
         onClick={hasMore ? toggle : undefined}
-        className={`w-full flex items-center gap-3 bg-gray-800/80 px-4 py-2.5 text-left ${
-          hasMore ? 'cursor-pointer hover:bg-gray-800' : 'cursor-default'
+        onKeyDown={hasMore ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } } : undefined}
+        className={`w-full flex items-center gap-3 bg-gray-50 dark:bg-gray-800/80 px-4 py-2.5 text-left ${
+          hasMore ? 'cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-800' : 'cursor-default'
         } transition-colors`}
       >
         {item.gameIcon && (
-          // eslint-disable-next-line @next/next/no-img-element
           <img src={item.gameIcon} alt="" className="w-8 h-8 rounded flex-shrink-0" />
         )}
         <a
-          ref={nameRef}
+          ref={setNameEl}
           href={`/game/${item.appId}`}
           onClick={(e) => e.stopPropagation()}
           onMouseEnter={scheduleOpen}
           onMouseLeave={scheduleClose}
-          className="text-[#66c0f4] font-semibold hover:underline truncate"
+          className="text-[#1b6fa8] dark:text-[#66c0f4] font-semibold hover:underline truncate"
         >
           {item.gameName}
         </a>
@@ -312,17 +298,17 @@ function GameGroup({ item }: { item: FeedItem }) {
           target="_blank"
           rel="noopener noreferrer"
           onClick={(e) => e.stopPropagation()}
-          className="ml-auto text-gray-500 hover:text-[#66c0f4] transition-colors text-xs flex items-center gap-1 flex-shrink-0"
+          className="ml-auto text-gray-500 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] transition-colors text-xs flex items-center gap-1 flex-shrink-0"
         >
           Steam
           <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
           </svg>
         </a>
-      </button>
+      </div>
 
       {/* 리뷰 목록 */}
-      <div className="divide-y divide-gray-700/30">
+      <div className="divide-y divide-gray-200 dark:divide-gray-700/30">
         {visibleReviews.map((review) => (
           <div key={review.recommendationid} className="px-2">
             <ReviewCard
@@ -340,7 +326,7 @@ function GameGroup({ item }: { item: FeedItem }) {
         <button
           type="button"
           onClick={toggle}
-          className="w-full px-4 py-2 text-xs text-gray-400 hover:text-[#66c0f4] bg-gray-800/40 hover:bg-gray-800/60 transition-colors text-center"
+          className="w-full px-4 py-2 text-xs text-gray-500 dark:text-gray-400 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] bg-gray-50 dark:bg-gray-800/40 hover:bg-gray-100 dark:hover:bg-gray-800/60 transition-colors text-center"
         >
           {expanded
             ? '접기'
@@ -349,10 +335,10 @@ function GameGroup({ item }: { item: FeedItem }) {
       )}
 
       {/* Hover preview — Portal로 body에 렌더링 */}
-      {showPreview && nameRef.current && (
+      {showPreview && nameEl && (
         <GameHoverPreview
           appId={item.appId}
-          anchorEl={nameRef.current}
+          anchorEl={nameEl}
           onMouseEnter={cancelClose}
           onMouseLeave={scheduleClose}
         />

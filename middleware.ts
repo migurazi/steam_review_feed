@@ -12,7 +12,7 @@ import { NextRequest, NextResponse } from "next/server";
 const PROTECTED_PAGES = ["/feed"];
 const PROTECTED_API = ["/api/wishlist", "/api/library", "/api/reviews"];
 
-const SESSION_COOKIE_NAME = "steam_review_feed_session";
+import { SESSION_COOKIE_NAME } from "@/lib/constants";
 
 export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;

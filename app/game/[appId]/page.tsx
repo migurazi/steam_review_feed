@@ -55,28 +55,28 @@ export default function GamePage({
 
   if (!appId) {
     return (
-      <div className="min-h-screen bg-gray-900 text-gray-100 flex items-center justify-center">
+      <div className="min-h-screen flex items-center justify-center">
         <div className="text-center space-y-4">
-          <p className="text-gray-400">올바르지 않은 App ID입니다.</p>
-          <Link href="/" className="text-[#66c0f4] hover:underline">홈으로 돌아가기</Link>
+          <p className="text-gray-500 dark:text-gray-400">올바르지 않은 App ID입니다.</p>
+          <Link href="/" className="text-[#1b6fa8] dark:text-[#66c0f4] hover:underline">홈으로 돌아가기</Link>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gray-900 text-gray-100 flex flex-col">
+    <div className="min-h-screen flex flex-col">
       {/* Header */}
-      <header className="sticky top-0 z-40 bg-gray-900/95 backdrop-blur border-b border-gray-800 px-4 py-3">
+      <header className="sticky top-0 z-40 bg-white/95 dark:bg-gray-900/95 backdrop-blur border-b border-gray-200 dark:border-gray-800 px-4 py-3">
         <div className="max-w-4xl mx-auto flex items-center justify-between">
-          <Link href="/" className="text-[#66c0f4] font-bold text-base">
+          <Link href="/" className="text-[#1b6fa8] dark:text-[#66c0f4] font-bold text-base">
             Steam Review Feed
           </Link>
           <div className="flex items-center gap-4">
-            <Link href="/feed" className="text-gray-400 text-sm hover:text-gray-200 transition-colors">
+            <Link href="/feed" className="text-gray-500 dark:text-gray-400 text-sm hover:text-gray-700 dark:hover:text-gray-200 transition-colors">
               피드
             </Link>
-            <Link href="/" className="text-gray-400 text-sm hover:text-gray-200 transition-colors">
+            <Link href="/" className="text-gray-500 dark:text-gray-400 text-sm hover:text-gray-700 dark:hover:text-gray-200 transition-colors">
               홈
             </Link>
           </div>
@@ -87,18 +87,18 @@ export default function GamePage({
         {/* Game info */}
         <div className="flex items-center justify-between">
           <div className="space-y-1">
-            <h1 className="text-xl font-bold text-white">
+            <h1 className="text-xl font-bold">
               {gameName || `AppID ${appId}`}
             </h1>
             {gameName && (
-              <p className="text-gray-500 text-xs">App ID: {appId}</p>
+              <p className="text-gray-400 dark:text-gray-500 text-xs">App ID: {appId}</p>
             )}
           </div>
           <a
             href={`https://store.steampowered.com/app/${appId}`}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-gray-400 hover:text-[#66c0f4] text-sm flex items-center gap-1 transition-colors"
+            className="text-gray-500 dark:text-gray-400 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] text-sm flex items-center gap-1 transition-colors"
           >
             Steam 스토어
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -109,7 +109,7 @@ export default function GamePage({
 
         {/* 미디어 섹션 — 동영상 또는 스크린샷 */}
         {media && (
-          <div className="rounded-lg overflow-hidden border border-gray-700/50">
+          <div className="rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700/50">
             <MediaPlayer
               movies={media.movies}
               screenshots={media.screenshots}
@@ -239,13 +239,13 @@ function GameSpecificReviewFeed({
         <ProgressBar loaded={progress.loaded} total={progress.total} />
       )}
       {loading && !progress && (
-        <div className="flex items-center gap-3 text-gray-400 text-sm py-4">
-          <div className="w-4 h-4 border-2 border-[#66c0f4] border-t-transparent rounded-full animate-spin" />
+        <div className="flex items-center gap-3 text-gray-500 dark:text-gray-400 text-sm py-4">
+          <div className="w-4 h-4 border-2 border-[#1b6fa8] dark:border-[#66c0f4] border-t-transparent rounded-full animate-spin" />
           리뷰를 불러오는 중...
         </div>
       )}
       {streamError && (
-        <div className="bg-red-900/40 border border-red-700 rounded-lg px-4 py-3 text-red-300 text-sm">
+        <div className="bg-red-50 dark:bg-red-900/40 border border-red-200 dark:border-red-700 rounded-lg px-4 py-3 text-red-600 dark:text-red-300 text-sm">
           {streamError}
         </div>
       )}
@@ -262,7 +262,7 @@ function GameSpecificReviewFeed({
         </div>
       )}
       {done && items.length === 0 && !streamError && (
-        <div className="text-center py-12 text-gray-500">
+        <div className="text-center py-12 text-gray-400 dark:text-gray-500">
           조건에 맞는 리뷰가 없습니다.
         </div>
       )}

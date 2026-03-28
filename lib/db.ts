@@ -4,6 +4,9 @@
  * better-sqlite3는 동기(synchronous) API를 사용한다.
  * MVP 규모(WAU 100)에서는 이벤트 루프 블로킹이 문제되지 않는다.
  * 확장 시 PostgreSQL로 전환할 때 비동기 드라이버로 교체.
+ *
+ * 주의: 이 모듈은 import만으로 사이드이펙트를 발생시키지 않는다.
+ *       정리 스케줄러는 initDb()를 명시적으로 호출해야 시작된다.
  */
 
 import Database from "better-sqlite3";
@@ -64,7 +67,11 @@ export interface DbUser {
 
 /**
  * Steam ID로 사용자를 조회하거나 없으면 새로 생성한다 (upsert).
- * 이미 존재하면 last_login_at만 갱신한다.
+ * 이미 존재하면 last_login_at과 display_name을 갱신한다.
+ *
+ * @param steamId Steam64 ID
+ * @param displayName Steam 닉네임 (없으면 기존 값 유지)
+ * @returns upsert된 사용자 레코드
  */
 export function upsertUser(
   steamId: string,
@@ -72,7 +79,6 @@ export function upsertUser(
 ): DbUser {
   const database = getDb();
 
-  // INSERT OR IGNORE로 중복 시 무시, 이후 UPDATE로 last_login_at 갱신
   database
     .prepare(
       `INSERT INTO users (steam_id, display_name) VALUES (?, ?)
@@ -88,7 +94,10 @@ export function upsertUser(
 }
 
 /**
- * Steam ID로 사용자를 조회한다. 없으면 null.
+ * Steam ID로 사용자를 조회한다.
+ *
+ * @param steamId Steam64 ID
+ * @returns 사용자 레코드. 없으면 null.
  */
 export function getUserBySteamId(steamId: string): DbUser | null {
   const database = getDb();
@@ -102,6 +111,10 @@ export function getUserBySteamId(steamId: string): DbUser | null {
 /**
  * 마지막 로그인으로부터 6개월 경과한 사용자 데이터를 삭제한다.
  * 기획서 8.2절: "마지막 로그인으로부터 6개월, 이후 자동 삭제"
+ *
+ * 트랜잭션으로 user_game_list -> users 순서로 삭제하여 FK 제약을 준수한다.
+ *
+ * @returns 삭제된 사용자 수
  */
 export function cleanupExpiredUsers(): number {
   const database = getDb();
@@ -125,12 +138,21 @@ export function cleanupExpiredUsers(): number {
   return result.changes;
 }
 
-// 만료 사용자 정리: 24시간마다 실행 (개인정보처리방침 준수)
+// --- 정리 스케줄러 ---
+
+/** 만료 사용자 정리 간격: 24시간 */
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
+/**
+ * 만료 사용자 자동 정리 스케줄러를 시작한다.
+ * 24시간마다 cleanupExpiredUsers()를 실행한다 (개인정보처리방침 준수).
+ *
+ * 주의: 이 함수는 명시적으로 호출해야 한다. 모듈 import만으로는 시작되지 않는다.
+ *       서버 초기화 시점(예: 미들웨어, layout)에서 한 번 호출한다.
+ */
 export function startCleanupScheduler(): void {
-  if (cleanupTimer) return;
+  if (cleanupTimer) return; // 중복 시작 방지
   cleanupTimer = setInterval(() => {
     try {
       const deleted = cleanupExpiredUsers();
@@ -141,11 +163,18 @@ export function startCleanupScheduler(): void {
       console.error("[db] Cleanup failed:", err);
     }
   }, CLEANUP_INTERVAL_MS);
-  // 타이머가 프로세스 종료를 막지 않도록
+  // 타이머가 프로세스 종료를 막지 않도록 unref
   if (cleanupTimer && typeof cleanupTimer === "object" && "unref" in cleanupTimer) {
     cleanupTimer.unref();
   }
 }
 
-// DB 초기화 시 스케줄러 시작
-startCleanupScheduler();
+/**
+ * 정리 스케줄러를 중지한다. 테스트에서 사용.
+ */
+export function stopCleanupScheduler(): void {
+  if (cleanupTimer) {
+    clearInterval(cleanupTimer);
+    cleanupTimer = null;
+  }
+}

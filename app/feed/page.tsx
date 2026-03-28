@@ -1,25 +1,59 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+/**
+ * 통합 리뷰 피드 페이지.
+ *
+ * 필터 상태를 URL 쿼리 파라미터에 저장하여:
+ * - 새로고침 시 필터 유지
+ * - 뒤로가기/앞으로가기 시 필터 복원
+ * - URL 공유 시 동일한 필터로 접근 가능
+ *
+ * useSearchParams()는 Suspense boundary가 필요하므로
+ * 페이지를 Suspense로 감싼다.
+ */
+
+import { Suspense, useEffect, useState, useCallback, useMemo } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
-import FilterPanel, { FilterState, DEFAULT_FILTERS } from '@/components/FilterPanel';
+import { useRouter, useSearchParams } from 'next/navigation';
+import FilterPanel, { FilterState } from '@/components/FilterPanel';
 import ReviewFeed from '@/components/ReviewFeed';
 import GameSearch from '@/components/GameSearch';
+import ThemeToggle from '@/components/ThemeToggle';
+import AboutDialog from '@/components/AboutDialog';
+import { parseFiltersFromParams, filtersToParams, saveFiltersToStorage, loadFiltersFromStorage } from '@/lib/filter-params';
 
 type DataSource = 'wishlist' | 'library' | 'both';
 
+/** Suspense 래퍼. useSearchParams()가 CSR bailout을 발생시키므로 필요. */
 export default function FeedPage() {
-  const [source, setSource] = useState<DataSource>('wishlist');
-  const [filters, setFilters] = useState<FilterState>({
-    ...DEFAULT_FILTERS,
-    source: 'wishlist',
-  });
+  return (
+    <Suspense fallback={
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="w-5 h-5 border-2 border-[#1b6fa8] dark:border-[#66c0f4] border-t-transparent rounded-full animate-spin" />
+      </div>
+    }>
+      <FeedPageContent />
+    </Suspense>
+  );
+}
+
+function FeedPageContent() {
+  const searchParams = useSearchParams();
+  const router = useRouter();
+
+  // 필터 초기값 복원 우선순위: URL 파라미터 > localStorage > 기본값
+  const initialFilters = useMemo(() => {
+    const fromUrl = parseFiltersFromParams(searchParams);
+    // URL에 파라미터가 있으면 URL 우선
+    if (searchParams.toString()) return fromUrl;
+    // URL에 파라미터가 없으면 localStorage에서 복원 시도
+    return loadFiltersFromStorage() ?? fromUrl;
+  }, [searchParams]);
+  const [filters, setFilters] = useState<FilterState>(initialFilters);
   const [loggingOut, setLoggingOut] = useState(false);
   const [displayName, setDisplayName] = useState<string | null>(null);
   const [steamId, setSteamId] = useState<string | null>(null);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
-  const router = useRouter();
 
   useEffect(() => {
     fetch('/api/auth/me')
@@ -32,13 +66,21 @@ export default function FeedPage() {
       .catch(() => {});
   }, []);
 
+  /** 필터 변경 시 URL + localStorage 모두 업데이트 */
+  const updateFilters = useCallback((newFilters: FilterState) => {
+    setFilters(newFilters);
+    saveFiltersToStorage(newFilters);
+    const qs = filtersToParams(newFilters);
+    const url = qs ? `/feed?${qs}` : '/feed';
+    router.replace(url, { scroll: false });
+  }, [router]);
+
   function handleSourceChange(newSource: DataSource) {
-    setSource(newSource);
-    setFilters((f) => ({ ...f, source: newSource }));
+    updateFilters({ ...filters, source: newSource });
   }
 
   function handleFilterChange(newFilters: FilterState) {
-    setFilters({ ...newFilters, source });
+    updateFilters({ ...newFilters, source: filters.source });
   }
 
   async function handleLogout() {
@@ -58,25 +100,25 @@ export default function FeedPage() {
   ];
 
   return (
-    <div className="min-h-screen bg-gray-900 text-gray-100 flex flex-col">
+    <div className="min-h-screen flex flex-col">
       {/* Header */}
-      <header className="sticky top-0 z-40 bg-gray-900/95 backdrop-blur border-b border-gray-800 px-4 py-3">
+      <header className="sticky top-0 z-40 bg-white/95 dark:bg-gray-900/95 backdrop-blur border-b border-gray-200 dark:border-gray-800 px-4 py-3">
         <div className="max-w-5xl mx-auto flex items-center justify-between gap-4">
-          <Link href="/" className="text-[#66c0f4] font-bold text-base shrink-0">
+          <Link href="/" className="text-[#1b6fa8] dark:text-[#66c0f4] font-bold text-base shrink-0">
             Steam Review Feed
           </Link>
 
           {/* Source tabs */}
-          <div className="flex bg-gray-800 rounded-lg p-1 gap-1">
+          <div className="flex bg-gray-100 dark:bg-gray-800 rounded-lg p-1 gap-1">
             {tabs.map((tab) => (
               <button
                 key={tab.value}
                 type="button"
                 onClick={() => handleSourceChange(tab.value)}
                 className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
-                  source === tab.value
-                    ? 'bg-[#1b2838] text-[#66c0f4] border border-[#4c6b8a]'
-                    : 'text-gray-400 hover:text-gray-200'
+                  filters.source === tab.value
+                    ? 'bg-white dark:bg-[#1b2838] text-[#1b6fa8] dark:text-[#66c0f4] border border-gray-300 dark:border-[#4c6b8a] shadow-sm'
+                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
                 }`}
               >
                 {tab.label}
@@ -93,21 +135,21 @@ export default function FeedPage() {
                 href={`https://steamcommunity.com/profiles/${steamId}`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="hidden sm:flex items-center gap-2 text-sm text-gray-400 hover:text-[#66c0f4] transition-colors"
+                className="hidden sm:flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] transition-colors"
                 title={steamId}
               >
                 {avatarUrl && (
-                  // eslint-disable-next-line @next/next/no-img-element
                   <img src={avatarUrl} alt="" className="w-6 h-6 rounded-full" />
                 )}
                 <span className="truncate max-w-[120px]">{displayName || steamId}</span>
               </a>
             )}
+            <ThemeToggle />
             <button
               type="button"
               onClick={handleLogout}
               disabled={loggingOut}
-              className="px-3 py-1.5 text-sm text-gray-400 border border-gray-700 rounded-lg hover:text-gray-200 hover:border-gray-600 transition-colors disabled:opacity-50"
+              className="px-3 py-1.5 text-sm text-gray-500 dark:text-gray-400 border border-gray-300 dark:border-gray-700 rounded-lg hover:text-gray-700 dark:hover:text-gray-200 hover:border-gray-400 dark:hover:border-gray-600 transition-colors disabled:opacity-50"
             >
               {loggingOut ? '...' : '로그아웃'}
             </button>
@@ -122,9 +164,10 @@ export default function FeedPage() {
         {/* Review feed */}
         <ReviewFeed key={JSON.stringify(filters)} filters={filters} />
 
-        {/* 게임 50개 상한 안내 */}
-        <div className="text-center pb-6 text-gray-500 text-xs">
-          최근 50개 게임의 리뷰를 표시합니다.
+        {/* 하단 안내 */}
+        <div className="text-center pb-6 text-gray-400 dark:text-gray-500 text-xs space-y-1">
+          <p>최근 50개 게임의 리뷰를 표시합니다.</p>
+          <p>Steam Review Feed <AboutDialog /></p>
         </div>
       </main>
     </div>

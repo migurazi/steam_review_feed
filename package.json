@@ -1,11 +1,13 @@
 {
   "name": "steam-review-feed",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "postbuild": "node -e \"const fs=require('fs');fs.cpSync('.next/static','.next/standalone/.next/static',{recursive:true});fs.cpSync('public','.next/standalone/public',{recursive:true})\"",
     "start": "next start",
+    "start:standalone": "node --env-file .env.local .next/standalone/server.js",
     "lint": "eslint",
     "test": "vitest run"
   },

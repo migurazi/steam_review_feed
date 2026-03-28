@@ -115,12 +115,12 @@ export default function GameHoverPreview({
     <div
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
-      className="fixed z-[60] w-[400px] bg-gray-900 border border-gray-700 rounded-lg shadow-2xl overflow-hidden"
+      className="fixed z-[60] w-[400px] bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-2xl overflow-hidden"
       style={{ top: pos.top, left: pos.left }}
     >
       {/* 로딩 skeleton */}
       {loading && (
-        <div className="aspect-video bg-gray-800 animate-pulse" />
+        <div className="aspect-video bg-gray-100 dark:bg-gray-800 animate-pulse" />
       )}
 
       {/* 미디어 렌더링 */}
@@ -135,7 +135,7 @@ export default function GameHoverPreview({
           {/* 짧은 설명 (2줄 제한) */}
           {data.short_description && (
             <div className="px-3 py-2">
-              <p className="text-gray-300 text-xs line-clamp-2">
+              <p className="text-gray-600 dark:text-gray-300 text-xs line-clamp-2">
                 {data.short_description}
               </p>
             </div>
@@ -145,8 +145,8 @@ export default function GameHoverPreview({
 
       {/* 데이터 없음 (fetch 실패) */}
       {!loading && !data && (
-        <div className="aspect-video bg-gray-800 flex items-center justify-center">
-          <span className="text-gray-500 text-xs">미리보기를 불러올 수 없습니다</span>
+        <div className="aspect-video bg-gray-100 dark:bg-gray-800 flex items-center justify-center">
+          <span className="text-gray-400 dark:text-gray-500 text-xs">미리보기를 불러올 수 없습니다</span>
         </div>
       )}
     </div>

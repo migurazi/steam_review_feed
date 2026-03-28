@@ -4,10 +4,11 @@
  * MediaPlayer — 공유 미디어 렌더링 컴포넌트.
  *
  * hover 팝업(compact)과 게임 상세 페이지(full)에서 공통으로 사용한다.
- * 미디어 우선순위: 동영상(HLS) → 스크린샷 슬라이드 → 헤더 이미지 fallback.
+ * 동영상(HLS) + 스크린샷을 통합 갤러리로 표시한다.
+ * 미디어가 없으면 헤더 이미지 fallback.
  *
- * - compact: 작은 사이즈, 컨트롤 숨김, 자동재생 (hover 팝업)
- * - full: 동영상+스크린샷 통합 갤러리, 이전/다음 컨트롤, 재생/음소거 (게임 상세 페이지)
+ * - compact (hover 팝업): 작은 이전/다음 버튼, 썸네일 이미지, 자동재생
+ * - full (게임 상세 페이지): 큰 이전/다음 버튼, 원본 이미지, 재생/음소거 컨트롤
  */
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
@@ -96,7 +97,6 @@ function HlsVideo({
 
   return (
     <div className="relative">
-      {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
       <video
         ref={videoRef}
         muted={muted}
@@ -152,45 +152,11 @@ function HlsVideo({
 }
 
 /**
- * 스크린샷 슬라이드쇼 (compact variant 전용).
- * 3초 간격 자동 전환. path_thumbnail 사용.
- * full variant의 스크린샷 탐색은 MediaGallery가 담당한다.
- */
-function ScreenshotSlideshow({
-  screenshots,
-}: {
-  screenshots: SteamScreenshot[];
-}) {
-  const [index, setIndex] = useState(0);
-
-  // 3초 간격 자동 전환
-  useEffect(() => {
-    if (screenshots.length <= 1) return;
-    const timer = setInterval(() => {
-      setIndex((prev) => (prev + 1) % screenshots.length);
-    }, 3000);
-    return () => clearInterval(timer);
-  }, [screenshots.length]);
-
-  return (
-    <div className="relative aspect-video overflow-hidden">
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img
-        key={screenshots[index].id}
-        src={screenshots[index].path_thumbnail}
-        alt={`Screenshot ${index + 1}`}
-        className="w-full h-full object-cover"
-      />
-    </div>
-  );
-}
-
-/**
- * 통합 미디어 갤러리 (full variant 전용).
+ * 통합 미디어 갤러리.
  *
- * 동영상과 스크린샷을 하나의 리스트로 합쳐
- * 이전/다음 버튼으로 탐색할 수 있다.
+ * 동영상과 스크린샷을 하나의 리스트로 합쳐 이전/다음 버튼으로 탐색한다.
  * 동영상이 먼저, 스크린샷이 뒤에 배치된다.
+ * compact=true이면 작은 컨트롤과 썸네일 이미지를 사용한다.
  */
 type GalleryItem =
   | { type: 'movie'; movie: SteamMovie }
@@ -200,10 +166,13 @@ function MediaGallery({
   movies,
   screenshots,
   headerImage,
+  compact = false,
 }: {
   movies: SteamMovie[];
   screenshots: SteamScreenshot[];
   headerImage: string;
+  /** true면 hover 팝업용 (작은 컨트롤, 썸네일 이미지) */
+  compact?: boolean;
 }) {
   const [index, setIndex] = useState(0);
   /** 동영상 에러 발생한 movie id 집합 */
@@ -241,7 +210,6 @@ function MediaGallery({
   if (totalCount === 0) {
     return (
       <div className="aspect-video">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src={headerImage} alt="Game header" className="w-full h-full object-cover" />
       </div>
     );
@@ -255,14 +223,13 @@ function MediaGallery({
           <HlsVideo
             key={current.movie.id}
             src={current.movie.hls_h264}
-            variant="full"
+            variant={compact ? 'compact' : 'full'}
             onError={() => handleMovieError(current.movie.id)}
           />
         ) : (
-          // eslint-disable-next-line @next/next/no-img-element
           <img
             key={`ss-${current.screenshot.id}`}
-            src={current.screenshot.path_full}
+            src={compact ? current.screenshot.path_thumbnail : current.screenshot.path_full}
             alt={`Screenshot ${safeIndex + 1}`}
             className="w-full h-full object-cover"
           />
@@ -275,20 +242,20 @@ function MediaGallery({
           <button
             type="button"
             onClick={goPrev}
-            className="absolute z-10 left-2 top-1/2 -translate-y-1/2 bg-black/60 hover:bg-black/80 text-white rounded-full p-2 transition-colors"
+            className={`absolute z-10 left-1 top-1/2 -translate-y-1/2 bg-black/60 hover:bg-black/80 text-white rounded-full transition-colors ${compact ? 'p-1' : 'p-2'}`}
             aria-label="이전"
           >
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className={compact ? 'w-3.5 h-3.5' : 'w-5 h-5'} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
             </svg>
           </button>
           <button
             type="button"
             onClick={goNext}
-            className="absolute z-10 right-2 top-1/2 -translate-y-1/2 bg-black/60 hover:bg-black/80 text-white rounded-full p-2 transition-colors"
+            className={`absolute z-10 right-1 top-1/2 -translate-y-1/2 bg-black/60 hover:bg-black/80 text-white rounded-full transition-colors ${compact ? 'p-1' : 'p-2'}`}
             aria-label="다음"
           >
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className={compact ? 'w-3.5 h-3.5' : 'w-5 h-5'} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
             </svg>
           </button>
@@ -297,7 +264,7 @@ function MediaGallery({
 
       {/* 하단 인디케이터 — 동영상은 ▶ 아이콘, 스크린샷은 ● 점 */}
       {totalCount > 1 && (
-        <div className="absolute z-10 bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-1.5 bg-black/50 rounded-full px-2 py-1 max-w-[80%] overflow-x-auto">
+        <div className={`absolute z-10 bottom-1.5 left-1/2 -translate-x-1/2 flex items-center bg-black/50 rounded-full max-w-[80%] overflow-x-auto ${compact ? 'gap-1 px-1.5 py-0.5' : 'gap-1.5 px-2 py-1'}`}>
           {validItems.map((item, i) => (
             <button
               key={item.type === 'movie' ? `m-${item.movie.id}` : `s-${item.screenshot.id}`}
@@ -322,8 +289,8 @@ function MediaGallery({
 /**
  * MediaPlayer 메인 컴포넌트.
  *
- * - compact (hover 팝업): 동영상 → 스크린샷 슬라이드 → 헤더 이미지 fallback
- * - full (게임 상세 페이지): 동영상 + 스크린샷 통합 갤러리, 이전/다음 컨트롤
+ * - compact (hover 팝업): 동영상+스크린샷 통합 갤러리, 작은 이전/다음 컨트롤, 자동재생
+ * - full (게임 상세 페이지): 동영상+스크린샷 통합 갤러리, 이전/다음 컨트롤, 재생/음소거
  */
 export default function MediaPlayer({
   movies,
@@ -331,50 +298,12 @@ export default function MediaPlayer({
   headerImage,
   variant,
 }: MediaPlayerProps) {
-  // full variant: 통합 갤러리
-  if (variant === 'full') {
-    return (
-      <MediaGallery
-        movies={movies ?? []}
-        screenshots={screenshots ?? []}
-        headerImage={headerImage}
-      />
-    );
-  }
-
-  // compact variant: 기존 우선순위 로직 (동영상 → 스크린샷 → 헤더)
-  return <CompactMediaPlayer movies={movies} screenshots={screenshots} headerImage={headerImage} />;
-}
-
-/**
- * Compact variant용 미디어 플레이어.
- * 동영상 → 스크린샷 슬라이드 → 헤더 이미지 순서로 fallback.
- */
-function CompactMediaPlayer({
-  movies,
-  screenshots,
-  headerImage,
-}: {
-  movies?: SteamMovie[];
-  screenshots?: SteamScreenshot[];
-  headerImage: string;
-}) {
-  const [videoFailed, setVideoFailed] = useState(false);
-  const handleVideoError = useCallback(() => setVideoFailed(true), []);
-
-  const firstMovie = movies?.[0];
-  if (firstMovie && !videoFailed) {
-    return <HlsVideo src={firstMovie.hls_h264} variant="compact" onError={handleVideoError} />;
-  }
-
-  if (screenshots && screenshots.length > 0) {
-    return <ScreenshotSlideshow screenshots={screenshots} />;
-  }
-
   return (
-    <div className="aspect-video">
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src={headerImage} alt="Game header" className="w-full h-full object-cover" />
-    </div>
+    <MediaGallery
+      movies={movies ?? []}
+      screenshots={screenshots ?? []}
+      headerImage={headerImage}
+      compact={variant === 'compact'}
+    />
   );
 }

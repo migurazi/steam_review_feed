@@ -7,6 +7,8 @@
 
 import { getIronSession, type IronSession } from "iron-session";
 import { cookies } from "next/headers";
+import { getSessionSecret } from "@/lib/env";
+import { SESSION_COOKIE_NAME } from "@/lib/constants";
 
 /** 세션에 저장되는 데이터 구조 */
 export interface SessionData {
@@ -16,12 +18,9 @@ export interface SessionData {
 }
 
 function getSessionOptions() {
-  if (!process.env.SESSION_SECRET) {
-    throw new Error("SESSION_SECRET 환경변수가 설정되지 않았습니다. .env.local 파일을 확인하세요.");
-  }
   return {
-    password: process.env.SESSION_SECRET,
-    cookieName: "steam_review_feed_session",
+    password: getSessionSecret(),
+    cookieName: SESSION_COOKIE_NAME,
     cookieOptions: {
       secure: process.env.NODE_ENV === "production",
       httpOnly: true,
@@ -30,8 +29,6 @@ function getSessionOptions() {
     },
   };
 }
-
-export const SESSION_COOKIE_NAME = "steam_review_feed_session";
 
 /**
  * 현재 요청의 세션을 가져온다.

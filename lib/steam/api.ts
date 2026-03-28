@@ -2,15 +2,22 @@
  * Steam API 클라이언트.
  *
  * 모든 Steam API 호출을 캐시 우선으로 처리한다.
- * 캐시 미스 시 API 호출 → 캐시 저장. Rate Limit 딜레이 적용.
+ * 캐시 미스 시 API 호출 -> 캐시 저장. Rate Limit 딜레이 적용.
  *
  * API 분류 (기획서 7.1절):
  * - 공식 API (api.steampowered.com): IWishlistService, IPlayerService, ISteamUser
  * - 공식 문서화 (store.steampowered.com): appreviews
  * - 비공식 (store.steampowered.com): appdetails, storesearch
+ *
+ * 에러 처리:
+ *   fetchJson은 모든 HTTP 오류를 null로 반환한다.
+ *   상태별(429, 403, 5xx) 상세 메시지를 콘솔에 기록하여 디버깅이 가능하다.
+ *   네트워크 오류, Content-Type 불일치, JSON 파싱 실패도 null 반환.
  */
 
 import { cacheGet, cacheSet, CACHE_TTL } from "@/lib/cache";
+import { getSteamApiKey } from "@/lib/env";
+import { STEAM_API_DELAY } from "@/lib/constants";
 import type {
   SteamWishlistItem,
   SteamWishlistResponse,
@@ -24,13 +31,6 @@ import type {
   SteamStoreSearchItem,
   SteamStoreSearchResponse,
 } from "./types";
-
-function getApiKey(): string {
-  if (!process.env.STEAM_API_KEY) {
-    throw new Error("STEAM_API_KEY 환경변수가 설정되지 않았습니다. .env.local 파일을 확인하세요.");
-  }
-  return process.env.STEAM_API_KEY;
-}
 
 const STEAM_API_BASE = "https://api.steampowered.com";
 const STEAM_STORE_BASE = "https://store.steampowered.com";
@@ -49,18 +49,41 @@ function delay(ms: number): Promise<void> {
 
 // --- 공통 fetch 헬퍼 ---
 
+/**
+ * URL을 fetch하여 JSON으로 파싱한다.
+ *
+ * HTTP 오류 시 SteamApiError를 throw하지 않고 null을 반환한다.
+ * 단, 에러 정보는 콘솔에 기록하여 디버깅이 가능하다.
+ * 네트워크 오류, Content-Type 불일치, JSON 파싱 실패도 null 반환.
+ *
+ * @param url 요청 URL
+ * @returns 파싱된 JSON 객체 또는 null (실패 시)
+ */
 async function fetchJson<T>(url: string): Promise<T | null> {
   try {
     const res = await fetch(url);
+
     if (!res.ok) {
-      console.error(`[steam-api] HTTP ${res.status} for ${maskUrl(url)}`);
+      const masked = maskUrl(url);
+      // 상태별 상세 경고 메시지
+      if (res.status === 429) {
+        console.warn(`[steam-api] Rate limited (429) for ${masked}`);
+      } else if (res.status === 403) {
+        console.error(`[steam-api] Unauthorized (403) for ${masked} - API Key가 만료되었거나 유효하지 않습니다`);
+      } else if (res.status >= 500) {
+        console.error(`[steam-api] Server error (${res.status}) for ${masked}`);
+      } else {
+        console.error(`[steam-api] HTTP ${res.status} for ${masked}`);
+      }
       return null;
     }
+
     const contentType = res.headers.get("content-type") || "";
     if (!contentType.includes("application/json")) {
       console.error(`[steam-api] Unexpected content-type "${contentType}" for ${maskUrl(url)}`);
       return null;
     }
+
     return (await res.json()) as T;
   } catch (err) {
     console.error(`[steam-api] Fetch failed for ${maskUrl(url)}:`, err);
@@ -73,6 +96,9 @@ async function fetchJson<T>(url: string): Promise<T | null> {
 /**
  * 위시리스트 게임 목록을 가져온다.
  * IWishlistService/GetWishlist/v1 (공식 API, API Key 필요)
+ *
+ * @param steamId Steam64 ID
+ * @returns 위시리스트 아이템 배열과 stale 여부. 실패 시 null.
  */
 export async function getWishlist(
   steamId: string
@@ -81,7 +107,7 @@ export async function getWishlist(
   const cached = cacheGet<SteamWishlistItem[]>(cacheKey);
   if (cached) return cached;
 
-  const url = `${STEAM_API_BASE}/IWishlistService/GetWishlist/v1/?key=${getApiKey()}&steamid=${steamId}`;
+  const url = `${STEAM_API_BASE}/IWishlistService/GetWishlist/v1/?key=${getSteamApiKey()}&steamid=${steamId}`;
   const res = await fetchJson<SteamWishlistResponse>(url);
 
   if (!res?.response?.items) return null;
@@ -95,6 +121,9 @@ export async function getWishlist(
  * 소유 게임 목록을 가져온다.
  * IPlayerService/GetOwnedGames/v1 (공식 API, API Key 필요)
  * include_appinfo=true로 name, img_icon_url 포함.
+ *
+ * @param steamId Steam64 ID
+ * @returns 소유 게임 배열과 stale 여부. 실패 시 null.
  */
 export async function getOwnedGames(
   steamId: string
@@ -105,7 +134,7 @@ export async function getOwnedGames(
 
   const url =
     `${STEAM_API_BASE}/IPlayerService/GetOwnedGames/v1/` +
-    `?key=${getApiKey()}&steamid=${steamId}` +
+    `?key=${getSteamApiKey()}&steamid=${steamId}` +
     `&include_appinfo=true&include_played_free_games=true`;
   const res = await fetchJson<SteamOwnedGamesResponse>(url);
 
@@ -120,8 +149,11 @@ export async function getOwnedGames(
  * 앱 상세 정보를 가져온다 (게임 이름, is_free, 이미지 등).
  * store.steampowered.com/api/appdetails (비공식 API)
  *
- * Rate Limit: 1초 딜레이 필요.
- * 삭제/이관된 앱은 success=false → null 반환.
+ * Rate Limit: appDetails 딜레이 적용.
+ * 삭제/이관된 앱은 success=false -> null 반환.
+ *
+ * @param appId Steam App ID
+ * @returns 앱 상세 정보와 stale 여부. 실패 시 null.
  */
 export async function getAppDetails(
   appId: number
@@ -130,8 +162,8 @@ export async function getAppDetails(
   const cached = cacheGet<SteamAppDetails>(cacheKey);
   if (cached) return cached;
 
-  // 비공식 API Rate Limit: 1초 딜레이
-  await delay(1000);
+  // 비공식 API Rate Limit 준수
+  await delay(STEAM_API_DELAY.appDetails);
 
   const url = `${STEAM_STORE_BASE}/api/appdetails?appids=${appId}`;
   const res = await fetchJson<SteamAppDetailsResponse>(url);
@@ -149,12 +181,13 @@ export async function getAppDetails(
  * 게임 리뷰를 가져온다.
  * store.steampowered.com/appreviews/{appid} (공식 문서화 API)
  *
- * Rate Limit: 0.5초 딜레이 필요.
+ * Rate Limit: reviews 딜레이 적용.
  *
  * @param appId 게임 AppID
  * @param language 언어 코드 (예: "koreana", "english"). "all"이면 전체.
- * @param count 가져올 리뷰 수 (기본 10, 최대 20)
+ * @param count 가져올 리뷰 수 (1~20, 기본 10)
  * @param dayRange 기간 필터 (일). 0이면 전체 기간. Steam API day_range 파라미터로 직접 전달.
+ * @returns 리뷰 배열과 stale 여부. 실패 시 null.
  */
 export async function getReviews(
   appId: number,
@@ -167,8 +200,8 @@ export async function getReviews(
   const cached = cacheGet<SteamReview[]>(cacheKey);
   if (cached) return cached;
 
-  // 공식 문서화 API Rate Limit: 0.5초 딜레이
-  await delay(500);
+  // 공식 문서화 API Rate Limit 준수
+  await delay(STEAM_API_DELAY.reviews);
 
   let url =
     `${STEAM_STORE_BASE}/appreviews/${appId}?json=1` +
@@ -197,6 +230,7 @@ export async function getReviews(
  * 커스텀 URL을 Steam64 ID로 변환한다.
  * ISteamUser/ResolveVanityURL/v1 (공식 API)
  *
+ * @param vanityUrl 커스텀 URL 문자열 (예: "migurazi")
  * @returns Steam64 ID 문자열. 변환 실패 시 null.
  */
 export async function resolveVanityUrl(
@@ -204,7 +238,7 @@ export async function resolveVanityUrl(
 ): Promise<string | null> {
   const url =
     `${STEAM_API_BASE}/ISteamUser/ResolveVanityURL/v1/` +
-    `?key=${getApiKey()}&vanityurl=${encodeURIComponent(vanityUrl)}`;
+    `?key=${getSteamApiKey()}&vanityurl=${encodeURIComponent(vanityUrl)}`;
   const res = await fetchJson<SteamVanityUrlResponse>(url);
 
   if (!res || res.response.success !== 1) return null;
@@ -215,6 +249,7 @@ export async function resolveVanityUrl(
  * 게임을 이름으로 검색한다.
  * store.steampowered.com/api/storesearch (비공식 API)
  *
+ * @param query 검색어
  * @returns 검색 결과 배열. 실패 시 빈 배열.
  */
 export async function searchGames(
@@ -231,13 +266,16 @@ export async function searchGames(
 /**
  * Steam 사용자 프로필 정보를 가져온다 (닉네임, 아바타 등).
  * ISteamUser/GetPlayerSummaries/v2 (공식 API)
+ *
+ * @param steamId Steam64 ID
+ * @returns 닉네임과 아바타 URL. 실패 시 null.
  */
 export async function getPlayerSummary(
   steamId: string
 ): Promise<{ personaname: string; avatarfull: string } | null> {
   const url =
     `${STEAM_API_BASE}/ISteamUser/GetPlayerSummaries/v2/` +
-    `?key=${getApiKey()}&steamids=${steamId}`;
+    `?key=${getSteamApiKey()}&steamids=${steamId}`;
   const res = await fetchJson<{
     response: {
       players: Array<{ personaname: string; avatarfull: string }>;

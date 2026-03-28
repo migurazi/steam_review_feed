@@ -3,15 +3,14 @@
  * GET /api/wishlist?offset=0
  *
  * 세션의 steamId로 IWishlistService 호출 (캐시 우선).
- * date_added 최신순 정렬, 50개 상한, offset으로 페이지네이션.
+ * date_added 최신순 정렬, PAGE_SIZE개 상한, offset으로 페이지네이션.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { getSession } from "@/lib/session";
 import { getWishlist } from "@/lib/steam/api";
 import { rateLimitResponse } from "@/lib/rate-limit";
-
-const PAGE_SIZE = 50;
+import { PAGE_SIZE } from "@/lib/constants";
 
 export async function GET(request: NextRequest) {
   const limited = rateLimitResponse(request);

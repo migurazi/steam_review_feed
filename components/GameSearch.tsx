@@ -19,11 +19,7 @@ export default function GameSearch() {
   const router = useRouter();
 
   const search = useCallback(async (q: string) => {
-    if (!q.trim()) {
-      setResults([]);
-      setOpen(false);
-      return;
-    }
+    if (!q.trim()) { setResults([]); setOpen(false); return; }
     setLoading(true);
     try {
       const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
@@ -32,36 +28,25 @@ export default function GameSearch() {
         setResults(data.results ?? []);
         setOpen(true);
       }
-    } catch {
-      // ignore
-    } finally {
-      setLoading(false);
-    }
+    } catch { /* ignore */ } finally { setLoading(false); }
   }, []);
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => {
-      search(query);
-    }, 300);
-    return () => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-    };
+    debounceRef.current = setTimeout(() => search(query), 300);
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
   }, [query, search]);
 
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) setOpen(false);
     }
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
   function handleSelect(result: SearchResult) {
-    setOpen(false);
-    setQuery('');
+    setOpen(false); setQuery('');
     router.push(`/game/${result.appId}`);
   }
 
@@ -69,40 +54,28 @@ export default function GameSearch() {
     <div ref={containerRef} className="relative w-full max-w-md">
       <div className="relative">
         <input
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          type="text" value={query} onChange={(e) => setQuery(e.target.value)}
           placeholder="게임 검색..."
-          className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 placeholder-gray-500 focus:outline-none focus:border-[#66c0f4] transition-colors"
-          onFocus={() => {
-            if (results.length > 0) setOpen(true);
-          }}
+          className="w-full px-4 py-3 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-[#1b6fa8] dark:focus:border-[#66c0f4] transition-colors"
+          onFocus={() => { if (results.length > 0) setOpen(true); }}
         />
         {loading && (
           <div className="absolute right-3 top-1/2 -translate-y-1/2">
-            <div className="w-4 h-4 border-2 border-[#66c0f4] border-t-transparent rounded-full animate-spin" />
+            <div className="w-4 h-4 border-2 border-[#1b6fa8] dark:border-[#66c0f4] border-t-transparent rounded-full animate-spin" />
           </div>
         )}
       </div>
 
       {open && results.length > 0 && (
-        <ul className="absolute top-full left-0 right-0 z-50 mt-1 bg-gray-800 border border-gray-700 rounded-lg shadow-xl overflow-hidden max-h-80 overflow-y-auto">
+        <ul className="absolute top-full left-0 right-0 z-50 mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl overflow-hidden max-h-80 overflow-y-auto">
           {results.map((result) => (
             <li key={result.appId}>
-              <button
-                type="button"
-                onClick={() => handleSelect(result)}
-                className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-gray-700 transition-colors text-left"
-              >
+              <button type="button" onClick={() => handleSelect(result)}
+                className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors text-left">
                 {result.imageUrl && (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    src={result.imageUrl}
-                    alt={result.name}
-                    className="w-10 h-6 object-cover rounded flex-shrink-0"
-                  />
+                  <img src={result.imageUrl} alt={result.name} className="w-10 h-6 object-cover rounded flex-shrink-0" />
                 )}
-                <span className="text-gray-100 text-sm truncate">{result.name}</span>
+                <span className="text-sm truncate">{result.name}</span>
               </button>
             </li>
           ))}
@@ -110,7 +83,7 @@ export default function GameSearch() {
       )}
 
       {open && !loading && results.length === 0 && query.trim() && (
-        <div className="absolute top-full left-0 right-0 z-50 mt-1 bg-gray-800 border border-gray-700 rounded-lg shadow-xl px-4 py-3 text-gray-400 text-sm">
+        <div className="absolute top-full left-0 right-0 z-50 mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl px-4 py-3 text-gray-500 dark:text-gray-400 text-sm">
           검색 결과가 없습니다.
         </div>
       )}
