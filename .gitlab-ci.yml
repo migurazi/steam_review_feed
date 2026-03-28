@@ -2,7 +2,7 @@ stages:
   - build
 
 variables:
-  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
   IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
 
 # Docker 이미지 빌드 & GitLab Container Registry에 push
@@ -20,5 +20,4 @@ build:
     - docker push $IMAGE_TAG
     - docker push $IMAGE_LATEST
   only:
-    - develop
-    - main
+    - tags
