@@ -7,8 +7,11 @@
  * 동영상(HLS) + 스크린샷을 통합 갤러리로 표시한다.
  * 미디어가 없으면 헤더 이미지 fallback.
  *
- * - compact (hover 팝업): 작은 이전/다음 버튼, 썸네일 이미지, 자동재생
+ * - compact (hover 팝업): 작은 이전/다음 버튼, 썸네일 이미지
  * - full (게임 상세 페이지): 큰 이전/다음 버튼, 원본 이미지, 재생/음소거 컨트롤
+ *
+ * 갤러리는 스크린샷을 먼저, 동영상을 뒤에 배치한다. 첫 진입 시 HLS 로딩 지연 없이
+ * 이미지가 즉시 보이고, 사용자가 동영상으로 이동하면 그때 HLS가 로드되며 자동재생된다.
  */
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
@@ -32,10 +35,13 @@ interface MediaPlayerProps {
  */
 function HlsVideo({
   src,
+  poster,
   variant,
   onError: onErrorProp,
 }: {
   src: string;
+  /** HLS manifest/segment 로딩 중 표시할 포스터 이미지. 빈 검정 화면 공백을 제거한다. */
+  poster?: string;
   variant: 'compact' | 'full';
   /** HLS 로딩 실패 시 호출 — 부모가 fallback(스크린샷 등)으로 전환 */
   onError?: () => void;
@@ -99,6 +105,7 @@ function HlsVideo({
     <div className="relative">
       <video
         ref={videoRef}
+        poster={poster}
         muted={muted}
         autoPlay
         loop
@@ -155,7 +162,7 @@ function HlsVideo({
  * 통합 미디어 갤러리.
  *
  * 동영상과 스크린샷을 하나의 리스트로 합쳐 이전/다음 버튼으로 탐색한다.
- * 동영상이 먼저, 스크린샷이 뒤에 배치된다.
+ * 스크린샷이 먼저, 동영상이 뒤에 배치된다 — HLS 로딩 지연 없이 즉시 프리뷰를 보여주기 위함.
  * compact=true이면 작은 컨트롤과 썸네일 이미지를 사용한다.
  */
 type GalleryItem =
@@ -178,11 +185,12 @@ function MediaGallery({
   /** 동영상 에러 발생한 movie id 집합 */
   const [failedMovies, setFailedMovies] = useState<Set<number>>(new Set());
 
-  // 동영상 → 스크린샷 순서로 통합, 실패한 동영상은 제외
+  // 스크린샷 → 동영상 순서로 통합, 실패한 동영상은 제외.
+  // 이미지 우선 배치는 HLS 로딩 대기 없이 즉시 프리뷰를 표시하기 위함.
   const validItems = useMemo(() => {
     const items: GalleryItem[] = [
-      ...movies.map((m): GalleryItem => ({ type: 'movie', movie: m })),
       ...screenshots.map((s): GalleryItem => ({ type: 'screenshot', screenshot: s })),
+      ...movies.map((m): GalleryItem => ({ type: 'movie', movie: m })),
     ];
     return items.filter(
       (item) => !(item.type === 'movie' && failedMovies.has(item.movie.id))
@@ -223,6 +231,7 @@ function MediaGallery({
           <HlsVideo
             key={current.movie.id}
             src={current.movie.hls_h264}
+            poster={current.movie.thumbnail}
             variant={compact ? 'compact' : 'full'}
             onError={() => handleMovieError(current.movie.id)}
           />
@@ -289,8 +298,10 @@ function MediaGallery({
 /**
  * MediaPlayer 메인 컴포넌트.
  *
- * - compact (hover 팝업): 동영상+스크린샷 통합 갤러리, 작은 이전/다음 컨트롤, 자동재생
- * - full (게임 상세 페이지): 동영상+스크린샷 통합 갤러리, 이전/다음 컨트롤, 재생/음소거
+ * - compact (hover 팝업): 통합 갤러리, 작은 이전/다음 컨트롤
+ * - full (게임 상세 페이지): 통합 갤러리, 이전/다음 컨트롤, 재생/음소거
+ *
+ * 상세 동작(아이템 순서, 자동재생 타이밍 등)은 파일 상단 JSDoc 참조.
  */
 export default function MediaPlayer({
   movies,
