@@ -68,7 +68,9 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 
 ### 사전 요구사항
 
-- Node.js 20+
+- **Node.js 20+** ([공식 다운로드](https://nodejs.org/ko/download))
+  - Windows에서 `setup.bat`을 실행하면 Node.js가 없을 경우 winget으로 자동 설치 가능
+  - winget 직접 사용: `winget install OpenJS.NodeJS.LTS`
 - Steam Web API Key ([여기서 발급받기](https://steamcommunity.com/dev/apikey))
 
 ### 1. 환경 변수 설정
@@ -84,6 +86,21 @@ NEXT_PUBLIC_BASE_URL=http://localhost:3000
 > `STEAM_API_KEY`와 `SESSION_SECRET`은 필수입니다. 설정하지 않으면 서버 시작 시 경고가 표시됩니다.
 
 ### 2. 설치 및 실행
+
+#### 윈도우일 때 실행하는 법 (Batch 파일, 권장)
+
+프로젝트 루트의 `.bat` 파일을 **더블클릭**만 하면 됩니다. 각 스크립트는 선행 조건(`node_modules`, `.env.local`, standalone 빌드)을 자동 검사합니다.
+
+| 파일 | 동작 |
+|------|------|
+| `setup.bat` | `npm install` + `.env.local` 자동 생성 (SESSION_SECRET 32바이트 랜덤 발급) |
+| `dev.bat` | 개발 서버 (`npm run dev`) |
+| `build.bat` | 프로덕션 빌드 (`npm run build`) |
+| `start.bat` | standalone 서버 실행 (`npm run start:standalone`) |
+
+처음 받았다면 `setup.bat` 실행 후 생성된 `.env.local`의 `STEAM_API_KEY`만 직접 입력하면 바로 사용 가능합니다.
+
+#### 수동 실행 (npm)
 
 ```bash
 # 의존성 설치

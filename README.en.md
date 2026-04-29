@@ -68,7 +68,9 @@ A service that aggregates the latest reviews from your Steam Wishlist and Librar
 
 ### Prerequisites
 
-- Node.js 20+
+- **Node.js 20+** ([Official download](https://nodejs.org/en/download))
+  - On Windows, running `setup.bat` will offer to install Node.js automatically via winget if it is missing
+  - Direct winget install: `winget install OpenJS.NodeJS.LTS`
 - Steam Web API Key ([Get one here](https://steamcommunity.com/dev/apikey))
 
 ### 1. Environment Variables
@@ -84,6 +86,21 @@ NEXT_PUBLIC_BASE_URL=http://localhost:3000
 > `STEAM_API_KEY` and `SESSION_SECRET` are required. A warning will be displayed on server start if missing.
 
 ### 2. Install & Run
+
+#### On Windows — Batch files (recommended)
+
+Just **double-click** the `.bat` files in the project root. Each script auto-checks prerequisites (`node_modules`, `.env.local`, standalone build).
+
+| File | Action |
+|------|--------|
+| `setup.bat` | `npm install` + auto-generates `.env.local` (32-byte random SESSION_SECRET) |
+| `dev.bat` | Dev server (`npm run dev`) |
+| `build.bat` | Production build (`npm run build`) |
+| `start.bat` | Standalone server (`npm run start:standalone`) |
+
+On first run, execute `setup.bat`, then fill in `STEAM_API_KEY` in the generated `.env.local` — that's it.
+
+#### Manual (npm)
 
 ```bash
 # Install dependencies
