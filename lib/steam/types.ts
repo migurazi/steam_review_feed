@@ -72,6 +72,36 @@ export interface SteamScreenshot {
   path_full: string;
 }
 
+/**
+ * appdetails API의 가격 정보. cc=KR로 호출 시 KRW 단위.
+ * is_free=true이거나 미출시/지역제한 게임은 응답에 미포함.
+ *
+ * 주의: KRW는 initial/final이 원 단위 그대로 (예: 30000=₩30,000),
+ * USD/EUR 등은 1/100 단위(cent). UI에서는 *_formatted 필드 사용 권장.
+ */
+export interface SteamPriceOverview {
+  /** 통화 코드 (예: "KRW") */
+  currency: string;
+  /** 정가 (KRW는 원 단위) */
+  initial: number;
+  /** 최종 가격 (KRW는 원 단위) */
+  final: number;
+  /** 할인율 (%). 0=할인 없음 */
+  discount_percent: number;
+  /** 정가 표시 문자열 (예: "₩30,000") */
+  initial_formatted: string;
+  /** 최종 가격 표시 문자열 (예: "₩15,000") */
+  final_formatted: string;
+}
+
+/** appdetails API의 출시일 정보. coming_soon=true면 미출시. */
+export interface SteamReleaseDate {
+  /** true=미출시(출시 예정) */
+  coming_soon: boolean;
+  /** 출시일 표시 문자열 (예: "2025년 12월 1일", "TBA", "Coming Soon") */
+  date: string;
+}
+
 export interface SteamAppDetails {
   name: string;
   steam_appid: number;
@@ -82,6 +112,10 @@ export interface SteamAppDetails {
   type: string;
   movies?: SteamMovie[];
   screenshots?: SteamScreenshot[];
+  /** 가격 정보. is_free=true이거나 미출시/지역제한 시 미포함. */
+  price_overview?: SteamPriceOverview;
+  /** 출시일 정보. UI에서 미출시 게임 라벨 분기에 사용. */
+  release_date?: SteamReleaseDate;
 }
 
 /**
@@ -187,6 +221,14 @@ export interface GameReviewsEvent {
   reviews: SteamReview[];
   /** 해당 언어의 리뷰가 0건인 경우 true */
   noReviewsInLanguage?: boolean;
+  /** 무료 게임 여부 (is_free). UI에서 "무료" 배지 표시용 */
+  isFree?: boolean;
+  /** 가격 정보. 무료/미출시/지역제한 시 undefined */
+  price?: SteamPriceOverview;
+  /** 미출시 게임 여부. true면 "출시 예정" 라벨 */
+  comingSoon?: boolean;
+  /** 출시일 표시 문자열 (미출시 게임용, 예: "2025년 12월 1일") */
+  releaseDate?: string;
 }
 
 /**

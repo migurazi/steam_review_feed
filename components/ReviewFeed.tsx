@@ -1,11 +1,12 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { GameReviewsEvent, ProgressEvent as ProgressEventData, SteamReview } from '@/lib/steam/types';
+import { GameReviewsEvent, ProgressEvent as ProgressEventData, SteamPriceOverview, SteamReview } from '@/lib/steam/types';
 import { FilterState } from './FilterPanel';
 import ReviewCard from './ReviewCard';
 import ProgressBar from './ProgressBar';
 import GameHoverPreview from './GameHoverPreview';
+import GamePrice from './GamePrice';
 
 interface ReviewFeedProps {
   filters: FilterState;
@@ -18,6 +19,10 @@ interface FeedItem {
   gameIcon: string;
   reviews: SteamReview[];
   noReviewsInLanguage?: boolean;
+  isFree?: boolean;
+  price?: SteamPriceOverview;
+  comingSoon?: boolean;
+  releaseDate?: string;
 }
 
 function buildStreamUrl(filters: FilterState, offset: number): string {
@@ -63,6 +68,10 @@ export default function ReviewFeed({ filters, offset = 0 }: ReviewFeedProps) {
             gameIcon: data.gameIcon,
             reviews: data.reviews,
             noReviewsInLanguage: data.noReviewsInLanguage,
+            isFree: data.isFree,
+            price: data.price,
+            comingSoon: data.comingSoon,
+            releaseDate: data.releaseDate,
           },
         ]);
       } catch {
@@ -293,18 +302,28 @@ function GameGroup({ item }: { item: FeedItem }) {
           </svg>
         )}
 
-        <a
-          href={`https://store.steampowered.com/app/${item.appId}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          className="ml-auto text-gray-500 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] transition-colors text-xs flex items-center gap-1 flex-shrink-0"
-        >
-          Steam
-          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-          </svg>
-        </a>
+        <div className="ml-auto flex items-center gap-3 flex-shrink-0">
+          <GamePrice
+            price={item.price}
+            isFree={item.isFree}
+            comingSoon={item.comingSoon}
+            releaseDate={item.releaseDate}
+            variant="compact"
+          />
+
+          <a
+            href={`https://store.steampowered.com/app/${item.appId}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="text-gray-500 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] transition-colors text-xs flex items-center gap-1"
+          >
+            Steam
+            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+            </svg>
+          </a>
+        </div>
       </div>
 
       {/* 리뷰 목록 */}

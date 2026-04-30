@@ -25,6 +25,7 @@ import type {
   SteamOwnedGamesResponse,
   SteamAppDetails,
   SteamAppDetailsResponse,
+  SteamPriceOverview,
   SteamReview,
   SteamReviewsResponse,
   SteamVanityUrlResponse,
@@ -146,11 +147,14 @@ export async function getOwnedGames(
 }
 
 /**
- * 앱 상세 정보를 가져온다 (게임 이름, is_free, 이미지 등).
+ * 앱 상세 정보를 가져온다 (게임 이름, is_free, 가격, 이미지 등).
  * store.steampowered.com/api/appdetails (비공식 API)
  *
  * Rate Limit: appDetails 딜레이 적용.
  * 삭제/이관된 앱은 success=false -> null 반환.
+ *
+ * 가격은 cc=KR&l=koreana로 KRW 기준 조회. price_overview는 자주 변하므로
+ * 별도 캐시 키 `app:{appId}:price`로 짧은 TTL(appPrice)에 분리 저장한다.
  *
  * @param appId Steam App ID
  * @returns 앱 상세 정보와 stale 여부. 실패 시 null.
@@ -158,14 +162,15 @@ export async function getOwnedGames(
 export async function getAppDetails(
   appId: number
 ): Promise<{ data: SteamAppDetails; isStale: boolean } | null> {
-  const cacheKey = `app:${appId}:info`;
+  const cacheKey = `app:${appId}:info:KR`;
   const cached = cacheGet<SteamAppDetails>(cacheKey);
   if (cached) return cached;
 
   // 비공식 API Rate Limit 준수
   await delay(STEAM_API_DELAY.appDetails);
 
-  const url = `${STEAM_STORE_BASE}/api/appdetails?appids=${appId}`;
+  // cc=KR로 한국 지역 가격(KRW), l=koreana로 한국어 정보 요청
+  const url = `${STEAM_STORE_BASE}/api/appdetails?appids=${appId}&cc=KR&l=koreana`;
   const res = await fetchJson<SteamAppDetailsResponse>(url);
 
   if (!res) return null;
@@ -174,7 +179,34 @@ export async function getAppDetails(
   if (!appData?.success || !appData.data) return null;
 
   cacheSet(cacheKey, appData.data, CACHE_TTL.appInfo);
+  // 가격은 별도 캐시로 짧은 TTL 분리 저장 (없으면 null로 저장하여 재호출 방지)
+  cacheSet(
+    `app:${appId}:price:KR`,
+    appData.data.price_overview ?? null,
+    CACHE_TTL.appPrice
+  );
   return { data: appData.data, isStale: false };
+}
+
+/**
+ * 가격 정보만 빠르게 조회한다.
+ * 가격 캐시(`app:{appId}:price`, 1시간 TTL)를 우선 확인하고,
+ * 미스 시 getAppDetails를 호출해 캐시를 채운다.
+ *
+ * 무료 게임 또는 가격 정보 없는 게임은 null 반환.
+ *
+ * @param appId Steam App ID
+ * @returns 가격 정보. 없으면 null.
+ */
+export async function getAppPrice(
+  appId: number
+): Promise<SteamPriceOverview | null> {
+  const cached = cacheGet<SteamPriceOverview | null>(`app:${appId}:price:KR`);
+  if (cached) return cached.data;
+
+  // 캐시 미스: getAppDetails가 두 캐시를 모두 채운다
+  const details = await getAppDetails(appId);
+  return details?.data.price_overview ?? null;
 }
 
 /**

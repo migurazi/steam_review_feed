@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import SteamLoginButton from '@/components/SteamLoginButton';
 import GameSearch from '@/components/GameSearch';
@@ -12,7 +12,29 @@ export default function Home() {
   const [steamInput, setSteamInput] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [inputError, setInputError] = useState<string | null>(null);
+  /** 세션 확인 중에는 hero/login UI 깜빡임을 방지하기 위해 잠시 빈 화면 유지 */
+  const [authChecked, setAuthChecked] = useState(false);
   const router = useRouter();
+
+  // 이미 로그인된 사용자가 헤더 로고 등으로 /에 도착하면 /feed로 자동 이동.
+  // 비로그인 시에는 그대로 hero/login UI 표시.
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/auth/me')
+      .then((res) => res.json())
+      .then((data: { steamId: string | null }) => {
+        if (cancelled) return;
+        if (data.steamId) {
+          router.replace('/feed');
+        } else {
+          setAuthChecked(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setAuthChecked(true);
+      });
+    return () => { cancelled = true; };
+  }, [router]);
 
   async function handleManualSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -37,6 +59,15 @@ export default function Home() {
     } finally {
       setSubmitting(false);
     }
+  }
+
+  // 세션 확인 전에는 깜빡임 방지를 위해 빈 화면 (로딩 스피너만)
+  if (!authChecked) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="w-5 h-5 border-2 border-[#1b6fa8] dark:border-[#66c0f4] border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
   }
 
   return (

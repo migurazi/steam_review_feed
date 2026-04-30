@@ -38,6 +38,7 @@ import type {
   SteamOwnedGame,
   SteamReview,
   SteamAppDetails,
+  SteamPriceOverview,
 } from "@/lib/steam/types";
 
 export const dynamic = "force-dynamic";
@@ -83,7 +84,7 @@ function sseEvent(event: string, data: unknown): Uint8Array {
  */
 async function getAppInfo(appId: number): Promise<SteamAppDetails | null> {
   // 캐시에서 먼저 확인
-  const cached = cacheGet<SteamAppDetails>(`app:${appId}:info`);
+  const cached = cacheGet<SteamAppDetails>(`app:${appId}:info:KR`);
   if (cached) return cached.data;
 
   // 캐시 미스: appdetails 호출 (딜레이 포함)
@@ -170,6 +171,10 @@ async function streamReviews(
     const details = await getAppInfo(appIdNum);
     const gameName = details?.name || `AppID ${filters.appId}`;
     const gameIcon = details?.header_image || "";
+    const isFree = details?.is_free;
+    const price = details?.price_overview;
+    const comingSoon = details?.release_date?.coming_soon;
+    const releaseDate = details?.release_date?.date;
 
     const reviewResult = await getReviews(
       appIdNum,
@@ -192,6 +197,10 @@ async function streamReviews(
         gameIcon,
         reviews,
         noReviewsInLanguage,
+        isFree,
+        price,
+        comingSoon,
+        releaseDate,
       })
     );
     controller.enqueue(sseEvent("progress", { loaded: 1, total: 1 }));
@@ -232,7 +241,7 @@ async function streamReviews(
       loaded++;
 
       if (result.status === "fulfilled" && result.value) {
-        const { appId, gameName, gameIcon, reviews, noReviewsInLanguage } = result.value;
+        const { appId, gameName, gameIcon, reviews, noReviewsInLanguage, isFree, price, comingSoon, releaseDate } = result.value;
         totalReviews += reviews.length;
 
         controller.enqueue(
@@ -242,6 +251,10 @@ async function streamReviews(
             gameIcon,
             reviews,
             noReviewsInLanguage,
+            isFree,
+            price,
+            comingSoon,
+            releaseDate,
           })
         );
       }
@@ -278,6 +291,10 @@ async function processGame(
   gameIcon: string;
   reviews: SteamReview[];
   noReviewsInLanguage: boolean;
+  isFree?: boolean;
+  price?: SteamPriceOverview;
+  comingSoon?: boolean;
+  releaseDate?: string;
 } | null> {
   if (isCancelled()) return null;
 
@@ -285,9 +302,14 @@ async function processGame(
   const appInfo = game.name ? null : await getAppInfo(game.appId);
 
   // 무료 게임 제외 필터
+  // 라이브러리 게임(game.name 존재)은 appInfo를 부르지 않으므로 캐시만 확인.
+  const cachedInfo = game.name
+    ? cacheGet<SteamAppDetails>(`app:${game.appId}:info:KR`)?.data
+    : null;
+
   if (filters.excludeFree) {
     const isFree = game.name
-      ? (cacheGet<SteamAppDetails>(`app:${game.appId}:info`)?.data?.is_free ?? null)
+      ? (cachedInfo?.is_free ?? null)
       : (appInfo?.is_free ?? null);
 
     if (isFree === true) return null;
@@ -297,6 +319,14 @@ async function processGame(
   // 게임 이름/아이콘 확보
   const gameName = game.name || appInfo?.name || `AppID ${game.appId}`;
   const gameIcon = game.icon || appInfo?.header_image || "";
+
+  // 가격/무료/출시 정보. 라이브러리 게임은 appInfo 호출을 피하기 위해 캐시만 사용.
+  // 캐시 미스 시 가격 정보 없이 표시 (사용자가 다른 경로로 appdetails 호출 시 채워짐).
+  const isFree = appInfo?.is_free ?? cachedInfo?.is_free;
+  const price = appInfo?.price_overview ?? cachedInfo?.price_overview;
+  const releaseInfo = appInfo?.release_date ?? cachedInfo?.release_date;
+  const comingSoon = releaseInfo?.coming_soon;
+  const releaseDate = releaseInfo?.date;
 
   if (isCancelled()) return null;
 
@@ -331,7 +361,7 @@ async function processGame(
     noReviewsInLanguage = true;
   }
 
-  return { appId: game.appId, gameName, gameIcon, reviews, noReviewsInLanguage };
+  return { appId: game.appId, gameName, gameIcon, reviews, noReviewsInLanguage, isFree, price, comingSoon, releaseDate };
 }
 
 // --- 게임 목록 수집 ---

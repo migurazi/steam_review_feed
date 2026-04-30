@@ -6,7 +6,8 @@ import FilterPanel, { FilterState, DEFAULT_FILTERS } from '@/components/FilterPa
 import ReviewCard from '@/components/ReviewCard';
 import ProgressBar from '@/components/ProgressBar';
 import MediaPlayer from '@/components/MediaPlayer';
-import type { GameReviewsEvent, ProgressEvent as ProgressEventData, SteamReview, SteamMovie, SteamScreenshot } from '@/lib/steam/types';
+import GamePrice from '@/components/GamePrice';
+import type { GameReviewsEvent, ProgressEvent as ProgressEventData, SteamReview, SteamMovie, SteamScreenshot, SteamPriceOverview } from '@/lib/steam/types';
 
 export default function GamePage({
   params,
@@ -29,9 +30,17 @@ export default function GamePage({
     header_image: string;
   } | null>(null);
 
+  /** 가격 정보 */
+  const [priceInfo, setPriceInfo] = useState<{
+    isFree: boolean;
+    price: SteamPriceOverview | null;
+    comingSoon: boolean;
+    releaseDate: string | null;
+  } | null>(null);
+
   useEffect(() => {
     if (!appId) return;
-    // 게임 이름과 미디어 데이터를 병렬 fetch
+    // 게임 이름, 미디어, 가격 데이터를 병렬 fetch
     fetch(`/api/search?appId=${appId}`)
       .then((res) => res.json())
       .then((data) => {
@@ -45,6 +54,13 @@ export default function GamePage({
       .then((res) => res.ok ? res.json() : null)
       .then((data) => {
         if (data) setMedia(data);
+      })
+      .catch(() => {});
+
+    fetch(`/api/game/${appId}/price`)
+      .then((res) => res.ok ? res.json() : null)
+      .then((data) => {
+        if (data) setPriceInfo(data);
       })
       .catch(() => {});
   }, [appId]);
@@ -85,26 +101,37 @@ export default function GamePage({
 
       <main className="flex-1 max-w-4xl mx-auto w-full px-4 py-6 space-y-5">
         {/* Game info */}
-        <div className="flex items-center justify-between">
-          <div className="space-y-1">
-            <h1 className="text-xl font-bold">
+        <div className="flex items-center justify-between gap-4">
+          <div className="space-y-1 min-w-0">
+            <h1 className="text-xl font-bold truncate">
               {gameName || `AppID ${appId}`}
             </h1>
             {gameName && (
               <p className="text-gray-400 dark:text-gray-500 text-xs">App ID: {appId}</p>
             )}
           </div>
-          <a
-            href={`https://store.steampowered.com/app/${appId}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-gray-500 dark:text-gray-400 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] text-sm flex items-center gap-1 transition-colors"
-          >
-            Steam 스토어
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-            </svg>
-          </a>
+          <div className="flex items-center gap-4 flex-shrink-0">
+            {priceInfo && (
+              <GamePrice
+                price={priceInfo.price ?? undefined}
+                isFree={priceInfo.isFree}
+                comingSoon={priceInfo.comingSoon}
+                releaseDate={priceInfo.releaseDate ?? undefined}
+                variant="full"
+              />
+            )}
+            <a
+              href={`https://store.steampowered.com/app/${appId}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-gray-500 dark:text-gray-400 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] text-sm flex items-center gap-1 transition-colors"
+            >
+              Steam 스토어
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+              </svg>
+            </a>
+          </div>
         </div>
 
         {/* 미디어 섹션 — 동영상 또는 스크린샷 */}
