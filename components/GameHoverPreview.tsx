@@ -10,7 +10,7 @@
  * 클라이언트 캐시: 모듈 스코프 Map으로 동일 게임 재hover 시 재요청 방지.
  */
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import MediaPlayer from './MediaPlayer';
 import type { SteamMovie, SteamScreenshot } from '@/lib/steam/types';
@@ -70,6 +70,7 @@ export default function GameHoverPreview({
   const [data, setData] = useState<MediaData | null>(mediaCache.get(appId) ?? null);
   const [loading, setLoading] = useState(!mediaCache.has(appId));
   const [pos, setPos] = useState(() => calcPosition(anchorEl));
+  const popupRef = useRef<HTMLDivElement | null>(null);
 
   // 미디어 데이터 fetch (캐시 miss 시)
   useEffect(() => {
@@ -111,8 +112,31 @@ export default function GameHoverPreview({
     return () => window.removeEventListener('resize', handleResize);
   }, [anchorEl]);
 
+  // 마우스 추적 hover 유지 — anchor 와 popup 의 union 사각형 안이면 닫기 취소.
+  // anchor 에서 popup 으로 이동 중 빈 공간을 지나도 hover 가 유지된다.
+  // 마우스가 union 밖이면 noop → 부모의 scheduleClose timer 가 자연스럽게 fire.
+  useEffect(() => {
+    function handleMove(e: MouseEvent) {
+      if (!popupRef.current) return;
+      const a = anchorEl.getBoundingClientRect();
+      const p = popupRef.current.getBoundingClientRect();
+      const x = e.clientX;
+      const y = e.clientY;
+      const left = Math.min(a.left, p.left);
+      const right = Math.max(a.right, p.right);
+      const top = Math.min(a.top, p.top);
+      const bottom = Math.max(a.bottom, p.bottom);
+      if (x >= left && x <= right && y >= top && y <= bottom) {
+        onMouseEnter();
+      }
+    }
+    document.addEventListener('mousemove', handleMove);
+    return () => document.removeEventListener('mousemove', handleMove);
+  }, [anchorEl, onMouseEnter]);
+
   const popup = (
     <div
+      ref={popupRef}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
       className="fixed z-[60] w-[400px] bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-2xl overflow-hidden"

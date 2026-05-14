@@ -242,10 +242,11 @@ function GameGroup({ item }: { item: FeedItem }) {
     hoverTimeout.current = setTimeout(() => setShowPreview(true), 500);
   }, [canHover]);
 
-  // 50ms delay로 팝업 닫기 예약 (anchor↔팝업 이동 시 깜빡임 방지)
+  // 250ms delay로 팝업 닫기 예약 — anchor↔팝업이 가로/세로 갭을 두고 떨어진 경우에도
+  // 마우스가 빈 공간을 통과해 popup에 도달할 시간을 확보.
   const scheduleClose = useCallback(() => {
     clearTimeout(hoverTimeout.current);
-    closeTimeout.current = setTimeout(() => setShowPreview(false), 50);
+    closeTimeout.current = setTimeout(() => setShowPreview(false), 250);
   }, []);
 
   // 팝업 hover 진입 시 닫기 취소
