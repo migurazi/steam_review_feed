@@ -5,6 +5,43 @@
 
 ## [Unreleased]
 
+### Added
+
+- **성향 분석 + 보유 게임 추천** (`/recommend`) — 라이브러리 플레이타임 분포에서
+  장르·카테고리 신호를 추출하여 두 트랙으로 추천
+  - 트랙 A: 라이브러리에 있지만 안 해본 게임 (`classify`가 'unplayed'로 분류한 후보)
+  - 트랙 B: 위시리스트 중 성향과 일치하는 게임
+  - 결정론적 룰 기반 (LLM 미사용): 로그 가중치 `log(1 + playtime)`,
+    `score = Σ matchedGenre.share + W_CAT × Σ matchedCategory.share`
+  - 매칭은 id 기반 (cc=KR 한국어 description에 비의존적)
+- **카드 농사 제외 옵션** — 트레이딩 카드 발급용 단기 플레이를 분석에서 제외
+  - 세 구간 분류: `pt ≤ unplayedMax`(미플레이) / `unplayedMax < pt < cardFarmingMax`(카드 농사) /
+    `pt ≥ cardFarmingMax`(분석 기여)
+  - 사용자 슬라이더로 임계값 조정 (기본 60분 / 180분, 두 슬라이더 자동 클램프)
+- **SSE 추천 API** — `GET /api/recommend?cardMin=...&unplayedMax=...&tracks=lib,wish`
+  - `progress` / `result` / `done` 이벤트 (선례 reviews/stream의 cancel 패턴 차용)
+  - `done` 플래그: `libraryFetchFailed`, `wishlistFetchFailed`,
+    `analysisInsufficient`, `metaMissingDominant` — 클라이언트가 7가지 빈 상태 분기
+- **`getAppDetailsBatch` 헬퍼** — `STREAM_CONCURRENCY` 단위 병렬 메타 일괄 조회 +
+  `isCancelled` 즉시 반영 (라이브러리/위시리스트 합산 유니크 appid 처리)
+- **타입 확장** — `SteamGenre`, `SteamCategory` + `SteamAppDetails.genres/categories` 옵셔널 필드
+- **단위 테스트 +34** — `__tests__/profile.test.ts` (15 케이스 → 34 it), `steam-types`
+  +5 케이스. 94 → **128 테스트**.
+
+### Changed
+
+- `/feed` 헤더에 "성향 분석" 진입점 링크 추가
+- `EventType`에 `recommend_analyze` 추가 (`lib/logger.ts`)
+
+### Notes
+
+- `W_CAT` 기본값은 단계 0 사전 측정 결과(장르 엔트로피 2.962 ≥ 2.5)에 따라
+  조정 룰 적용으로 0.5 → **0.3** 하향. 자세한 측정 데이터는 작업 지시서
+  부록 A (`docs/20260527_01_profile_analysis_recommendation.md`) 참조.
+- 라이브러리 5,000+ 사용자는 Steam appdetails 비공식 API Rate Limit으로
+  첫 분석 완주가 어려울 수 있음 (R11). UI에 안내 노출. 후속에서 적응형
+  동시성 검토 예정.
+
 ## [0.3.0] - 2026-03-28
 
 ### Added

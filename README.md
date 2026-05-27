@@ -13,6 +13,7 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 ## 주요 기능
 
 - **통합 리뷰 피드** — 위시리스트·라이브러리 게임의 최신 리뷰를 한 화면에서 확인
+- **성향 분석 + 보유 게임 추천** (`/recommend`) — 라이브러리 플레이타임에서 장르·카테고리 신호를 추출하여 두 트랙(라이브러리 미플레이 / 위시리스트)으로 추천. 카드 농사용 단기 플레이는 사용자 조정 가능한 임계값으로 제외
 - **Steam 로그인** — Steam OpenID 로그인 또는 Steam ID 직접 입력
 - **SSE 점진적 로딩** — 게임별 리뷰가 병렬로 수집되어 실시간 스트리밍
 - **다양한 필터** — 언어, 기간, 플레이타임, 글자수, 추천/비추천, 무료 게임 제외
@@ -32,15 +33,16 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 | 캐시 | lru-cache (인메모리) |
 | 인증 | Steam OpenID |
 | 동영상 | hls.js (HLS 스트리밍) |
-| 테스트 | Vitest (77개 테스트) |
+| 테스트 | Vitest (128개 테스트) |
 | 배포 | Docker + GitLab CI/CD |
 
 ## 프로젝트 구조
 
 ```
 ├── app/
-│   ├── api/           # API 라우트 (auth, cache, reviews, search, wishlist, library, media)
+│   ├── api/           # API 라우트 (auth, cache, reviews, search, wishlist, library, media, recommend)
 │   ├── feed/          # 통합 리뷰 피드 페이지
+│   ├── recommend/     # 성향 분석 + 추천 페이지
 │   ├── game/[appId]/  # 게임별 리뷰 페이지
 │   ├── privacy/       # 개인정보 처리방침
 │   ├── layout.tsx     # 루트 레이아웃 (ThemeProvider, FOUC 방지)
@@ -55,8 +57,8 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 │   ├── logger.ts      # JSONL 이벤트 로깅
 │   ├── rate-limit.ts  # 사용자당 Rate Limit
 │   ├── session.ts     # iron-session 세션 관리
-│   └── steam/         # Steam API 클라이언트, 타입, 정렬, 필터
-├── __tests__/         # 단위 테스트 (11파일 77개)
+│   └── steam/         # Steam API 클라이언트, 타입, 정렬, 필터, 성향 분석(profile)
+├── __tests__/         # 단위 테스트 (13파일 128개)
 ├── middleware.ts       # 인증 미들웨어 (Edge Runtime)
 ├── Dockerfile
 ├── docker-compose.yml

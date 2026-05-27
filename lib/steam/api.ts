@@ -17,7 +17,7 @@
 
 import { cacheGet, cacheSet, CACHE_TTL } from "@/lib/cache";
 import { getSteamApiKey } from "@/lib/env";
-import { STEAM_API_DELAY } from "@/lib/constants";
+import { STEAM_API_DELAY, STREAM_CONCURRENCY } from "@/lib/constants";
 import type {
   SteamWishlistItem,
   SteamWishlistResponse,
@@ -293,6 +293,54 @@ export async function searchGames(
   const res = await fetchJson<SteamStoreSearchResponse>(url);
 
   return res?.items ?? [];
+}
+
+/**
+ * 여러 appid의 메타를 캐시 우선으로 일괄 조회한다.
+ *
+ * 사용처: `app/api/recommend/route.ts`. 라이브러리/위시리스트 합산 수십~수백
+ * 개의 appid에 대해 getAppDetails를 호출해야 하는데, 캐시 미스는 1초 딜레이가
+ * 누적되므로 STREAM_CONCURRENCY 단위로 병렬화한다.
+ *
+ * 취소(`isCancelled() === true`)는 매 배치 시작 전 검사 — 선례
+ * `app/api/reviews/stream/route.ts:228-264`의 패턴과 동일. 진행 중인 배치는
+ * 완료를 기다리고(개별 호출에 abort signal 미주입), 다음 배치로 넘어가기 전에
+ * 즉시 중단한다. delay()가 1초 단위로 짧아 큰 누수 없이 신속히 멈춘다.
+ *
+ * @param appIds 조회할 appid 배열. 중복은 호출 측에서 제거 권장.
+ * @param onProgress (loaded, total) — 한 게임 완료 시마다 호출
+ * @param isCancelled 취소 검사 함수. true 반환 시 즉시 return (지금까지 결과 반환).
+ * @returns Map<appid, SteamAppDetails | null>. null이면 조회 실패 (삭제/이관 앱 등).
+ */
+export async function getAppDetailsBatch(
+  appIds: number[],
+  onProgress?: (loaded: number, total: number) => void,
+  isCancelled: () => boolean = () => false
+): Promise<Map<number, SteamAppDetails | null>> {
+  const result = new Map<number, SteamAppDetails | null>();
+  const total = appIds.length;
+  let loaded = 0;
+
+  for (let i = 0; i < appIds.length; i += STREAM_CONCURRENCY) {
+    if (isCancelled()) return result;
+    const batch = appIds.slice(i, i + STREAM_CONCURRENCY);
+    const results = await Promise.allSettled(batch.map(id => getAppDetails(id)));
+    for (let j = 0; j < batch.length; j++) {
+      const appid = batch[j];
+      const r = results[j];
+      if (r.status === "fulfilled") {
+        result.set(appid, r.value?.data ?? null);
+      } else {
+        // Promise rejection은 fetchJson이 null 반환으로 처리하므로 거의 도달 안 함.
+        // 안전망: 거기서 실패하면 null로 기록하여 호출 측이 분기할 수 있도록.
+        result.set(appid, null);
+      }
+      loaded++;
+      onProgress?.(loaded, total);
+      if (isCancelled()) return result;
+    }
+  }
+  return result;
 }
 
 /**

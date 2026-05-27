@@ -127,6 +127,13 @@ function FeedPageContent() {
           </div>
 
           <div className="flex items-center gap-3">
+            <Link
+              href="/recommend"
+              className="hidden sm:inline text-sm text-gray-500 dark:text-gray-400 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] transition-colors"
+              title="보유 게임 성향 분석 + 추천"
+            >
+              성향 분석
+            </Link>
             <div className="hidden sm:block w-48">
               <GameSearch />
             </div>

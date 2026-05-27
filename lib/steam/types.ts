@@ -102,6 +102,34 @@ export interface SteamReleaseDate {
   date: string;
 }
 
+/**
+ * appdetails API의 장르 정보.
+ *
+ * 매칭은 반드시 id 기반으로 한다. description은 호출 시 cc/l 파라미터에 따라
+ * 언어가 달라지므로(cc=KR&l=koreana 호출 시 "액션" 등 한국어로 반환), 문자열
+ * 비교로 누적하면 같은 장르가 분산된다.
+ *
+ * 참조: 작업 지시서 4.3 (호환성 - 언어 매칭 정책)
+ */
+export interface SteamGenre {
+  /** 장르 ID (문자열, 예: "1"=Action) — 매칭의 기준 */
+  id: string;
+  /** 표시명 (cc=KR이면 한국어, 예: "액션") */
+  description: string;
+}
+
+/**
+ * appdetails API의 카테고리 정보 (싱글플레이어, 컨트롤러 지원 등).
+ *
+ * SteamGenre와 마찬가지로 id 기반 매칭, description은 표시 전용.
+ * Steam API는 카테고리 id를 정수로 반환한다 (장르 id는 문자열).
+ */
+export interface SteamCategory {
+  /** 카테고리 ID (정수, 예: 2=싱글플레이어) — 매칭의 기준 */
+  id: number;
+  description: string;
+}
+
 export interface SteamAppDetails {
   name: string;
   steam_appid: number;
@@ -116,6 +144,10 @@ export interface SteamAppDetails {
   price_overview?: SteamPriceOverview;
   /** 출시일 정보. UI에서 미출시 게임 라벨 분기에 사용. */
   release_date?: SteamReleaseDate;
+  /** 장르 목록. 일부 게임(데모, 도구 등)은 누락될 수 있어 옵셔널. */
+  genres?: SteamGenre[];
+  /** 카테고리 목록. 일부 게임은 누락될 수 있어 옵셔널. */
+  categories?: SteamCategory[];
 }
 
 /**

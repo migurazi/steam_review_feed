@@ -13,6 +13,7 @@ A service that aggregates the latest reviews from your Steam Wishlist and Librar
 ## Key Features
 
 - **Unified Review Feed** — View the latest reviews from Wishlist & Library games in one place
+- **Taste Analysis + Recommendations** (`/recommend`) — Extracts genre/category signals from your library playtime and recommends games in two tracks (library-unplayed / wishlist). Card-farming short plays are filtered by a user-adjustable threshold
 - **Steam Login** — Steam OpenID authentication or direct Steam ID input
 - **SSE Progressive Loading** — Reviews collected in parallel and streamed in real-time
 - **Rich Filters** — Language, date range, playtime, review length, positive/negative, exclude free games
@@ -32,15 +33,16 @@ A service that aggregates the latest reviews from your Steam Wishlist and Librar
 | Cache | lru-cache (in-memory) |
 | Auth | Steam OpenID |
 | Video | hls.js (HLS streaming) |
-| Testing | Vitest (77 tests) |
+| Testing | Vitest (128 tests) |
 | Deployment | Docker + GitLab CI/CD |
 
 ## Project Structure
 
 ```
 ├── app/
-│   ├── api/           # API routes (auth, cache, reviews, search, wishlist, library, media)
+│   ├── api/           # API routes (auth, cache, reviews, search, wishlist, library, media, recommend)
 │   ├── feed/          # Unified review feed page
+│   ├── recommend/     # Taste analysis + recommendations page
 │   ├── game/[appId]/  # Per-game review page
 │   ├── privacy/       # Privacy policy
 │   ├── layout.tsx     # Root layout (ThemeProvider, FOUC prevention)
@@ -55,8 +57,8 @@ A service that aggregates the latest reviews from your Steam Wishlist and Librar
 │   ├── logger.ts      # JSONL event logging
 │   ├── rate-limit.ts  # Per-user rate limiting
 │   ├── session.ts     # iron-session management
-│   └── steam/         # Steam API client, types, sorting, filters
-├── __tests__/         # Unit tests (11 files, 77 tests)
+│   └── steam/         # Steam API client, types, sorting, filters, taste profile
+├── __tests__/         # Unit tests (13 files, 128 tests)
 ├── middleware.ts       # Auth middleware (Edge Runtime)
 ├── Dockerfile
 ├── docker-compose.yml

@@ -23,7 +23,8 @@ export type EventType =
   | "game_view"
   | "filter_change"
   | "search"
-  | "load_more";
+  | "load_more"
+  | "recommend_analyze";
 
 interface LogEntry {
   timestamp: string;
