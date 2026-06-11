@@ -22,6 +22,8 @@ import {
   getReviews,
 } from "@/lib/steam/api";
 import { cacheGet } from "@/lib/cache";
+import { getAppMeta } from "@/lib/app-meta-cache";
+import { sseEvent, sseResponse } from "@/lib/sse";
 import { logEvent } from "@/lib/logger";
 import { rateLimitResponse } from "@/lib/rate-limit";
 import {
@@ -63,14 +65,6 @@ function parseFilters(params: URLSearchParams) {
     excludeFree: params.get("excludeFree") !== "false",
     offset: parseInt(params.get("offset") || "0", 10),
   };
-}
-
-/** 모듈 레벨 TextEncoder (매 호출마다 생성하지 않고 재사용) */
-const encoder = new TextEncoder();
-
-/** SSE 이벤트를 TextEncoder로 인코딩한다. */
-function sseEvent(event: string, data: unknown): Uint8Array {
-  return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 /**
@@ -138,13 +132,7 @@ export async function GET(request: NextRequest) {
     },
   });
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-    },
-  });
+  return sseResponse(stream);
 }
 
 /**
@@ -169,8 +157,9 @@ async function streamReviews(
   if (filters.appId) {
     const appIdNum = parseInt(filters.appId, 10);
     const details = await getAppInfo(appIdNum);
-    const gameName = details?.name || `AppID ${filters.appId}`;
-    const gameIcon = details?.header_image || "";
+    const dbMeta = details ? null : getAppMeta(appIdNum);
+    const gameName = details?.name || dbMeta?.name || `AppID ${filters.appId}`;
+    const gameIcon = details?.header_image || dbMeta?.headerImage || "";
     const isFree = details?.is_free;
     const price = details?.price_overview;
     const comingSoon = details?.release_date?.coming_soon;
@@ -316,9 +305,18 @@ async function processGame(
     // isFree === null (API 실패)이면 건너뛰지 않고 리뷰 조회 시도
   }
 
-  // 게임 이름/아이콘 확보
-  const gameName = game.name || appInfo?.name || `AppID ${game.appId}`;
-  const gameIcon = game.icon || appInfo?.header_image || "";
+  // 게임 이름/아이콘 확보 — Steam API가 Rate Limit 등으로 실패하면 DB 영속
+  // 메타를 마지막 fallback으로 시도. 그래도 없으면 "AppID 12345".
+  //
+  // dbMeta 조회는 동기 SQLite read라 hot path 비용이 미미하지만 0이 아니다.
+  // 라이브러리 게임(game.name+game.icon 모두 있음)은 fallback 불필요 → 항상
+  // skip. 위시리스트 게임은 game.name/icon이 없지만 appInfo가 성공했으면
+  // appInfo.name이 fallback chain의 다음 자리를 채우므로 역시 DB 조회 불필요.
+  // appInfo도 실패한 경우(API 장애)에만 DB lookup으로 마지막 fallback 시도.
+  const hasFreshMeta = (game.name && game.icon) || (appInfo?.name && appInfo.header_image);
+  const dbMeta = hasFreshMeta ? null : getAppMeta(game.appId);
+  const gameName = game.name || appInfo?.name || dbMeta?.name || `AppID ${game.appId}`;
+  const gameIcon = game.icon || appInfo?.header_image || dbMeta?.headerImage || "";
 
   // 가격/무료/출시 정보. 라이브러리 게임은 appInfo 호출을 피하기 위해 캐시만 사용.
   // 캐시 미스 시 가격 정보 없이 표시 (사용자가 다른 경로로 appdetails 호출 시 채워짐).

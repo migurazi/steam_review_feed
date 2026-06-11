@@ -35,9 +35,11 @@ describe("constants", () => {
     expect(RATE_LIMIT_MAX_REQUESTS).toBe(30);
   });
 
-  it("Steam API 딜레이가 올바르다", () => {
-    // 비공식 API는 1초, 공식 문서화 API는 0.5초
-    expect(STEAM_API_DELAY.appDetails).toBe(1000);
+  it("Steam API 딜레이가 올바르다 (appdetails Rate Limit 회피)", () => {
+    // appdetails는 비공식 API라 Rate Limit이 엄격(~40 req/min). STREAM_CONCURRENCY=1
+    // 과 조합해 1500ms 간격으로 호출 (= 40 req/min). reviews는 별도 endpoint로
+    // 더 너그러움.
+    expect(STEAM_API_DELAY.appDetails).toBe(1500);
     expect(STEAM_API_DELAY.reviews).toBe(500);
   });
 

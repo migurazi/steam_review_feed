@@ -49,6 +49,49 @@ export function getDb(): Database.Database {
       PRIMARY KEY (user_id, app_id, source),
       FOREIGN KEY (user_id) REFERENCES users(user_id)
     );
+
+    -- /recommend 분석 결과 캐시 — 사용자별 1행.
+    -- 사용자가 옵션을 바꾸지 않은 채 재방문하면 이 캐시에서 즉시 결과를 보여
+    -- 주고 백그라운드에서 새 분석을 진행한다. 새 분석이 끝나면 같은 행을
+    -- REPLACE 한다. 옵션이 바뀐 경우엔 options_hash가 달라 cache miss.
+    CREATE TABLE IF NOT EXISTS recommendation_cache (
+      user_id INTEGER PRIMARY KEY,
+      options_hash TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      computed_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(user_id)
+    );
+
+    -- 앱(게임) 메타 영속 캐시 — 사용자에 의존하지 않는 공용 테이블.
+    -- 인메모리 LRU 캐시는 서버 재시작 시 비고 Rate Limit 상황에서 appdetails
+    -- 호출이 실패하면 fallback이 "AppID 12345"가 되어 UX가 나빠진다. 한 번
+    -- 이라도 성공해서 받은 name/header_image를 여기 저장해 다음에 반드시
+    -- 표시되도록 한다.
+    CREATE TABLE IF NOT EXISTS app_meta (
+      app_id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      header_image TEXT,
+      updated_at INTEGER NOT NULL
+    );
+
+    -- 앱 상세(SteamAppDetails) 영속 캐시 — 인메모리 LRU의 백업.
+    -- 인메모리 LRU(lib/cache.ts)는 dev HMR이나 서버 재시작 시 비워지는데,
+    -- 5000+ 라이브러리의 appdetails 한 번 fetch에 ~30분 걸리므로 LRU 분실
+    -- 시 매번 처음부터 시작하는 회귀가 발생한다. 한 번 성공해 받은 details를
+    -- 여기에도 저장해 두면 LRU miss 시 SQLite에서 hydrate해 즉시 hit으로 처리.
+    --
+    -- price_overview는 별도 짧은 TTL 캐시(app:{appId}:price:KR, 1시간) 대상
+    -- 이므로 본 테이블에 저장하기 전 caller가 stripping해야 한다. 7일 지난
+    -- price를 hydrate해서 표시하면 잘못된 할인율 등이 보일 수 있음.
+    --
+    -- TTL은 read 시점에 fetched_at으로 검사 (CACHE_TTL.appInfo, 7일). 만료된
+    -- row는 즉시 cache miss로 처리하고 API 재호출. 만료 row의 자동 삭제는
+    -- 별도 정리 루틴 없이도 다음 갱신 시 INSERT OR REPLACE로 덮어쓴다.
+    CREATE TABLE IF NOT EXISTS app_details_cache (
+      app_id INTEGER PRIMARY KEY,
+      details TEXT NOT NULL,
+      fetched_at INTEGER NOT NULL
+    );
   `);
 
   return db;
@@ -122,6 +165,12 @@ export function cleanupExpiredUsers(): number {
   const cleanup = database.transaction(() => {
     database.exec(`
       DELETE FROM user_game_list WHERE user_id IN (
+        SELECT user_id FROM users
+        WHERE last_login_at < datetime('now', '-6 months')
+      )
+    `);
+    database.exec(`
+      DELETE FROM recommendation_cache WHERE user_id IN (
         SELECT user_id FROM users
         WHERE last_login_at < datetime('now', '-6 months')
       )

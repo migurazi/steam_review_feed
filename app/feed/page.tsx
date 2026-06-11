@@ -41,14 +41,16 @@ function FeedPageContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
 
-  // 필터 초기값 복원 우선순위: URL 파라미터 > localStorage > 기본값
-  const initialFilters = useMemo(() => {
-    const fromUrl = parseFiltersFromParams(searchParams);
-    // URL에 파라미터가 있으면 URL 우선
-    if (searchParams.toString()) return fromUrl;
-    // URL에 파라미터가 없으면 localStorage에서 복원 시도
-    return loadFiltersFromStorage() ?? fromUrl;
-  }, [searchParams]);
+  // 필터 초기값 — URL 파라미터 또는 기본값. localStorage는 hydration 안전을
+  // 위해 useEffect에서 복원한다.
+  //
+  // 회귀 방지: 이전엔 initialFilters가 loadFiltersFromStorage()를 호출했는데,
+  // 서버 렌더 시점엔 localStorage 접근 불가라 항상 null 반환. 클라이언트는
+  // 저장된 필터 반환. 결과적으로 server initial !== client initial → React
+  // hydration mismatch (filter source 탭의 selected/unselected className이
+  // server/client에서 다르게 렌더링됨). useEffect에서 mount 후 1회만 복원
+  // 하면 hydration tree는 일치하고 그 직후 setFilters로 자연스럽게 갱신.
+  const initialFilters = useMemo(() => parseFiltersFromParams(searchParams), [searchParams]);
   const [filters, setFilters] = useState<FilterState>(initialFilters);
   const [loggingOut, setLoggingOut] = useState(false);
   const [displayName, setDisplayName] = useState<string | null>(null);
@@ -64,6 +66,21 @@ function FeedPageContent() {
         setAvatarUrl(data.avatarUrl);
       })
       .catch(() => {});
+  }, []);
+
+  // localStorage 필터 복원 — hydration 직후 1회. URL에 명시적 파라미터가 있으면
+  // (사용자가 의도적으로 URL을 직접 조작했거나 공유 링크로 들어옴) localStorage
+  // 보다 URL 우선. mount 시점에 한 번만 실행돼야 하므로 deps는 빈 배열.
+  useEffect(() => {
+    if (searchParams.toString()) return; // URL 우선
+    const fromStorage = loadFiltersFromStorage();
+    if (fromStorage) {
+      setFilters(fromStorage);
+      // URL도 함께 갱신해 두면 새로고침/공유 시 일관 — but URL replace는 또
+      // 다른 라우터 사이클을 트리거하므로 의도적으로 생략. updateFilters가
+      // 다음 사용자 액션 시점에 URL을 정상화한다.
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /** 필터 변경 시 URL + localStorage 모두 업데이트 */

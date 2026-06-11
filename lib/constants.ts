@@ -25,17 +25,34 @@ export const RATE_LIMIT_MAX_REQUESTS = 30;
 
 /**
  * Steam API 호출 간 딜레이 (밀리초).
- * 비공식 API(appdetails)는 1초, 공식 문서화 API(appreviews)는 0.5초.
+ *
+ * appdetails는 비공식 API라 Rate Limit이 매우 엄격하다 — 커뮤니티 관측상
+ * ~200 req/5min(=40 req/min) 한도. 우리가 STREAM_CONCURRENCY × 1/delay 로
+ * 환산해 한도 안에 들어가야 거의 모든 호출이 200 OK를 받는다.
+ *
+ * 이전 설정(concurrency 3 + 1000ms)은 실효 180 req/min로 4배 초과 → 거의
+ * 모든 응답이 429. 5347 라이브러리 분석 시 appdetails 호출이 거의 다 null
+ * 반환, 분석 신호 무효, 캐시 미적재의 악순환 관측.
+ *
+ * 변경 후(concurrency 1 + 1500ms): 40 req/min — Steam 한도 내. 5347 게임 첫
+ * 분석은 ~134분으로 길지만, app_details_cache에 successfull 저장 → 다음
+ * 분석부터 캐시 hit으로 빠름. 한 번만 견디면 됨.
  */
 export const STEAM_API_DELAY = {
   /** store.steampowered.com/api/appdetails (비공식, Rate Limit 엄격) */
-  appDetails: 1000,
+  appDetails: 1500,
   /** store.steampowered.com/appreviews (공식 문서화) */
   reviews: 500,
 } as const;
 
-/** 동시에 병렬 처리할 게임 수 (SSE 스트리밍에서 사용) */
-export const STREAM_CONCURRENCY = 3;
+/**
+ * 동시에 병렬 처리할 게임 수 (SSE 스트리밍에서 사용).
+ *
+ * 1로 설정 — Steam appdetails Rate Limit 회피. 위 STEAM_API_DELAY 주석 참조.
+ * 리뷰 fetch는 별도 endpoint(공식 문서화)라 더 너그럽지만 단순성 위해 같은
+ * 값 공유.
+ */
+export const STREAM_CONCURRENCY = 1;
 
 /**
  * 필터 기본값.
