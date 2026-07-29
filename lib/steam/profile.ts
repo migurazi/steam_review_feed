@@ -21,13 +21,19 @@
  *   description 문자열 비교로 집계하면 같은 장르가 분산된다. id로 합산하고
  *   표시명(label)은 첫 등장한 description을 사용한다.
  *
- * 점수 산식:
- *   score = sum(matchedGenre.share) + W_CAT * sum(matchedCategory.share)
- *     W_CAT 기본 0.5. 단계 0 사전 측정 결과에 따라 조정 가능
- *     (작업 지시서 5절 단계 0 조정 룰).
+ * 매칭 점수 산식 (코사인 유사도, 작업 지시서 단계 1):
+ *   프로필 벡터 a(장르=share, 카테고리=W_CAT·share)와 후보 이진 벡터 b의
+ *   코사인 유사도 matchScore = a·b / (‖a‖·‖b‖) ∈ [0,1].
+ *   후보 norm ‖b‖로 나눠 다태그 편향을 제거한다. 자세한 정의는 scoreAgainstProfile 참조.
+ *   W_CAT 기본 0.3 (장르 신호가 풍부해 카테고리 영향 축소).
+ *
+ * 리뷰 블렌딩 (작업 지시서 단계 2):
+ *   최종 순위 = W_MATCH·matchScore + W_REVIEW·reviewScore.
+ *   reviewScore는 호평률 정규화값. 순수 함수 computeReviewScore/blendRecommendations가
+ *   담당하고, 리뷰 요약 조회(I/O)는 라우트 책임 (본 모듈 순수성 유지).
  */
 
-import type { SteamOwnedGame, SteamWishlistItem, SteamAppDetails } from "./types";
+import type { SteamOwnedGame, SteamWishlistItem, SteamAppDetails, ReviewSummary } from "./types";
 
 // ============================================================================
 // 옵션
@@ -164,6 +170,20 @@ export interface TasteProfile {
   categories: TasteEntry[];
 }
 
+/**
+ * 추천 카드에 표시하는 호평률 배지 데이터.
+ *
+ * reviewScore(신뢰도 수축된 정규화 랭킹 신호)와 달리, 사용자에게 보여줄 실제
+ * 호평 비율과 표본 크기를 그대로 담는다. 라벨/색상은 클라이언트가 percent에서
+ * 파생하며(한국어 보장), 저표본(리뷰 소수)은 표본 수를 함께 노출해 정직하게 표시한다.
+ */
+export interface ReviewBadge {
+  /** 호평 비율 0~100 (반올림). totalPositive / totalReviews. */
+  positivePercent: number;
+  /** 총 리뷰 수 (표본 크기). 저표본 판단 근거. */
+  totalReviews: number;
+}
+
 export interface Recommendation {
   appid: number;
   name: string;
@@ -171,12 +191,35 @@ export interface Recommendation {
   isFree: boolean;
   matchedGenres: { id: string; label: string }[];
   matchedCategories: { id: number; label: string }[];
+  /** 리뷰 호평률 배지 (블렌딩 시 요약 조회에 성공한 후보만). 표시용. */
+  reviewBadge?: ReviewBadge;
+  /**
+   * 취향 매칭 코사인 점수. 항상 [0, 1] 유계 (단계 1).
+   * 프로필 벡터 a·후보 벡터 b / (‖a‖·‖b‖). scoreAgainstProfile 참조.
+   */
+  matchScore: number;
+  /**
+   * 리뷰 호평률 정규화 점수 [0, 1]. 단계 2 블렌딩을 거친 결과에만 채워진다.
+   * 매칭 전용(partial-result 등) 결과에서는 undefined.
+   */
+  reviewScore?: number;
+  /**
+   * 최종 순위 점수.
+   * - 매칭 전용(블렌딩 전): score === matchScore.
+   * - 블렌딩 후: W_MATCH·matchScore + W_REVIEW·reviewScore.
+   */
   score: number;
   source: "library-unplayed" | "wishlist";
   /** 라이브러리 미플레이 후보일 때만 */
   playtimeMinutes?: number;
   /** 위시리스트 후보일 때만 */
   wishlistPriority?: number;
+  /**
+   * 위시리스트 후보일 때만. 위시리스트 추가 시각(Unix).
+   * blendRecommendations가 동점 tiebreak(priority 동률 시 최근 추가 우선)를
+   * recommendFromWishlist와 동일하게 유지하기 위해 보존한다.
+   */
+  wishlistDateAdded?: number;
 }
 
 // ============================================================================
@@ -342,37 +385,189 @@ function buildTopEntries<K extends string | number>(
 export const W_CAT = 0.3;
 
 /**
- * 매칭 점수 계산. id 기반.
+ * 매칭 코사인 유사도의 가중치 (블렌딩 시). 작업 지시서 2-3.
+ * PlayDate(pick.py) 기본 블렌드 `0.65·tags + 0.35·review` 채택.
+ * 두 항(matchScore, reviewScore)이 모두 [0,1] 유계이므로 별도 재스케일 없이 가중 합.
+ */
+export const W_MATCH = 0.65;
+export const W_REVIEW = 0.35;
+
+/**
+ * 프로필 벡터의 크기 ‖a‖.
  *
- * @returns { score, matchedGenres, matchedCategories }
+ * 벡터 정의 (작업 지시서 단계 1, Momus C-NEW 반영):
+ *   프로필 벡터 a: 장르 차원 = share, 카테고리 차원 = W_CAT·share.
+ *   ‖a‖ = sqrt( Σ_genre share² + W_CAT² · Σ_cat share² )
+ *
+ * 분석 1회당 상수이므로 recommend 함수 진입 시 한 번만 계산하여
+ * scoreAgainstProfile에 주입한다 (후보마다 재계산하지 않음).
+ */
+function computeProfileNorm(profile: TasteProfile): number {
+  let sumSq = 0;
+  for (const e of profile.genres) sumSq += e.share * e.share;
+  for (const e of profile.categories) sumSq += W_CAT * W_CAT * e.share * e.share;
+  return Math.sqrt(sumSq);
+}
+
+/**
+ * 후보와 프로필의 코사인 유사도(matchScore)를 계산한다. id 기반 매칭.
+ *
+ * 벡터 정의 (하나의 유클리드 내적 공간):
+ *   프로필 a: 장르 차원 = share, 카테고리 차원 = W_CAT·share, 미보유 = 0. (상수)
+ *   후보   b: 보유 장르 차원 = 1, 보유 카테고리 차원 = 1, 미보유 = 0. (순수 이진)
+ *
+ *   dot = a·b = Σ(matched genre.share) + W_CAT·Σ(matched cat.share)
+ *   ‖b‖ = sqrt(genreIds.length + categoryIds.length)   ← 후보는 이진이라 W_CAT 없음
+ *   matchScore = dot / (‖a‖·‖b‖)
+ *
+ * W_CAT는 프로필 벡터 a에만 얹는다. 그래야 dot·‖a‖·‖b‖가 같은 벡터 쌍에서 나와
+ * Cauchy-Schwarz(dot ≤ ‖a‖·‖b‖)가 성립하고 matchScore ∈ [0,1]이 엄밀히 보장된다.
+ * (후보 b에도 W_CAT를 얹으면 dot의 W_CAT¹와 ‖b‖의 W_CAT²가 어긋나 [0,1]이 깨진다.)
+ *
+ * ‖b‖는 후보가 보유한 전체 태그 수 기반이므로, 태그가 많은 게임일수록 분모가 커져
+ * 다태그 편향이 제거된다 (동일 매칭이면 태그 적은 게임이 우위).
+ *
+ * @param profileNorm computeProfileNorm(profile) 선계산값 (‖a‖).
+ * @returns matchScore(코사인)와 매칭된 장르/카테고리 목록.
  */
 function scoreAgainstProfile(
   candidate: { genreIds: string[]; categoryIds: number[]; genreLabels: Record<string, string>; categoryLabels: Record<number, string> },
-  profile: TasteProfile
-): { score: number; matchedGenres: { id: string; label: string }[]; matchedCategories: { id: number; label: string }[] } {
-  let score = 0;
+  profile: TasteProfile,
+  profileNorm: number
+): { matchScore: number; matchedGenres: { id: string; label: string }[]; matchedCategories: { id: number; label: string }[] } {
+  let dot = 0; // a·b
   const matchedGenres: { id: string; label: string }[] = [];
   const matchedCategories: { id: number; label: string }[] = [];
 
-  // 장르 매칭
+  // 장르 매칭 (후보 성분=1 → a 성분 share 그대로 누적)
   const profileGenreMap = new Map(profile.genres.map(e => [String(e.key), e]));
   for (const id of candidate.genreIds) {
     const hit = profileGenreMap.get(id);
     if (hit) {
-      score += hit.share;
+      dot += hit.share;
       matchedGenres.push({ id, label: candidate.genreLabels[id] ?? hit.label });
     }
   }
-  // 카테고리 매칭
+  // 카테고리 매칭 (후보 성분=1, a 성분=W_CAT·share → dot에 W_CAT·share 누적)
   const profileCatMap = new Map(profile.categories.map(e => [Number(e.key), e]));
   for (const id of candidate.categoryIds) {
     const hit = profileCatMap.get(id);
     if (hit) {
-      score += W_CAT * hit.share;
+      dot += W_CAT * hit.share;
       matchedCategories.push({ id, label: candidate.categoryLabels[id] ?? hit.label });
     }
   }
-  return { score, matchedGenres, matchedCategories };
+
+  // ‖b‖ = √(전체 태그 수). 후보 벡터는 순수 이진이므로 W_CAT 미포함.
+  const candNorm = Math.sqrt(candidate.genreIds.length + candidate.categoryIds.length);
+  const matchScore = profileNorm > 0 && candNorm > 0 ? dot / (profileNorm * candNorm) : 0;
+  return { matchScore, matchedGenres, matchedCategories };
+}
+
+/**
+ * 리뷰 호평률 요약을 [0,1] reviewScore로 정규화한다 (순수 함수, 작업 지시서 2-2).
+ *
+ * Steam의 review_score(0~10 등급)는 표본 수를 반영하지 못하므로, 호평 비율에
+ * 표본 신뢰도를 곱해 중립(0.5)으로 수축시킨다:
+ *   positiveRatio = totalPositive / totalReviews
+ *   confidence    = min(totalReviews, REVIEW_CONFIDENCE_SAMPLE) / REVIEW_CONFIDENCE_SAMPLE
+ *   reviewScore   = 0.5 + (positiveRatio − 0.5) · confidence
+ *
+ * positiveRatio, confidence 모두 [0,1]이므로 reviewScore ∈ [0,1] 보장.
+ * 요약 없음/표본 0 → 0.5(중립) fallback. (조회 실패한 후보를 추천에서 탈락시키지 않음)
+ *
+ * 방어적 클램프: Steam appreviews의 filter=all 응답은 total_reviews가
+ * total_positive+total_negative와 정확히 일치하지 않는 경우가 드물게 있어
+ * totalPositive > totalReviews면 positiveRatio > 1이 될 수 있다. 그대로 두면
+ * reviewScore > 1이 되어 [0,1] 보장이 깨지고 블렌딩 점수가 부당하게 튀므로
+ * positiveRatio를 [0,1]로 클램프한다.
+ */
+export const REVIEW_CONFIDENCE_SAMPLE = 50;
+
+export function computeReviewScore(
+  summary: { totalPositive: number; totalReviews: number } | null
+): number {
+  if (!summary || summary.totalReviews <= 0) return 0.5;
+  const positiveRatio = clamp01(summary.totalPositive / summary.totalReviews);
+  const confidence = Math.min(summary.totalReviews, REVIEW_CONFIDENCE_SAMPLE) / REVIEW_CONFIDENCE_SAMPLE;
+  return 0.5 + (positiveRatio - 0.5) * confidence;
+}
+
+/** 값을 [0,1]로 클램프. NaN은 상위에서 걸러지므로 다루지 않음. */
+function clamp01(x: number): number {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+/**
+ * 리뷰 요약을 카드 표시용 배지 데이터로 변환한다 (순수 함수).
+ *
+ * computeReviewScore(랭킹용 정규화)와 목적이 다르다: 여기선 사용자에게 보여줄
+ * 실제 호평 비율(반올림 %)과 표본 크기를 그대로 담는다.
+ *
+ * @returns 요약 없음/표본 0이면 null (배지 미표시).
+ */
+export function buildReviewBadge(summary: ReviewSummary | null): ReviewBadge | null {
+  if (!summary || summary.totalReviews <= 0) return null;
+  // computeReviewScore와 동일한 방어적 클램프 — totalPositive > totalReviews인
+  // 이상 데이터에서 "호평 105%" 같은 배지가 표시되지 않도록 비율을 [0,1]로 제한.
+  return {
+    positivePercent: Math.round(clamp01(summary.totalPositive / summary.totalReviews) * 100),
+    totalReviews: summary.totalReviews,
+  };
+}
+
+/**
+ * shortlist에 리뷰 호평률을 블렌딩하여 최종 점수로 재랭킹하고 limit로 자른다.
+ * (순수 함수, 작업 지시서 2-3/2-4). 라우트가 리뷰 요약 조회 후 호출.
+ *
+ * finalScore = W_MATCH·matchScore + W_REVIEW·reviewScore
+ *   reviewScoreByAppid에 없는 후보는 중립 0.5 fallback.
+ *
+ * 정렬: finalScore desc → matchScore desc → (playtime desc | priority asc) → appid asc.
+ *   두 항 모두 [0,1] 유계라 shortlist-상대 정규화 없이 결정론적으로 안정.
+ *   블렌딩은 한 트랙(동일 source)의 shortlist에 적용되므로 2차 tiebreak를
+ *   source별로 분기한다.
+ *
+ * @param shortlist matchScore 기준 상위 후보 (recommend* 함수가 limit=shortlist 크기로 반환).
+ * @param reviewScoreByAppid appid → computeReviewScore 결과.
+ * @param limit 최종 반환 개수 (maxRecommendationsPerTrack).
+ */
+export function blendRecommendations(
+  shortlist: Recommendation[],
+  reviewScoreByAppid: ReadonlyMap<number, number>,
+  limit: number
+): Recommendation[] {
+  const blended = shortlist.map(r => {
+    const reviewScore = reviewScoreByAppid.get(r.appid) ?? 0.5;
+    const score = W_MATCH * r.matchScore + W_REVIEW * reviewScore;
+    return { ...r, reviewScore, score };
+  });
+  // tiebreak 키(오름차순 비교): 각 항목을 "자신의" source 기준으로 환산한다.
+  // 항목별로 자기 source로 키잉하므로 혼합 source 입력이 들어와도 오정렬되지 않는다.
+  // (실사용에서는 트랙별 단일 source shortlist로만 호출됨)
+  //   - library-unplayed: playtime 내림차순 → -playtime.       (2차, 3차 없음)
+  //   - wishlist:         priority 오름차순(낮을수록 갖고 싶음) → priority (2차),
+  //                       그다음 dateAdded 내림차순(최근 추가 우선) → -dateAdded (3차).
+  // recommendLibraryUnplayed/recommendFromWishlist의 원 정렬과 동일하게 맞춰,
+  // partial(match-only)과 final(blended)의 동점 순서가 어긋나지 않도록 한다.
+  const key2 = (r: Recommendation): number =>
+    r.source === "library-unplayed"
+      ? -(r.playtimeMinutes ?? 0)
+      : (r.wishlistPriority ?? Number.MAX_SAFE_INTEGER);
+  const key3 = (r: Recommendation): number =>
+    r.source === "wishlist" ? -(r.wishlistDateAdded ?? 0) : 0;
+  blended.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
+    const k2a = key2(a);
+    const k2b = key2(b);
+    if (k2a !== k2b) return k2a - k2b;
+    const k3a = key3(a);
+    const k3b = key3(b);
+    if (k3a !== k3b) return k3a - k3b;
+    return a.appid - b.appid;
+  });
+  return blended.slice(0, limit);
 }
 
 /**
@@ -392,15 +587,17 @@ function scoreAgainstProfile(
 export function recommendLibraryUnplayed(
   owned: OwnedAnalyzedGame[],
   profile: TasteProfile,
-  opts: AnalyzeOptions
+  opts: AnalyzeOptions,
+  limit: number = opts.maxRecommendationsPerTrack
 ): Recommendation[] {
+  const profileNorm = computeProfileNorm(profile);
   const results: Recommendation[] = [];
   for (const g of owned) {
     if (classify(g, opts) !== "unplayed") continue;
-    const { score, matchedGenres, matchedCategories } = scoreAgainstProfile(g, profile);
-    // 메타 누락 후보(genreIds=[], categoryIds=[])는 score=0이 되어 여기서 탈락.
+    const { matchScore, matchedGenres, matchedCategories } = scoreAgainstProfile(g, profile, profileNorm);
+    // 메타 누락 후보(genreIds=[], categoryIds=[])는 matchScore=0이 되어 여기서 탈락.
     // 작업 지시서 케이스 #6 — "메타 누락 게임은 추천 후보 자격 박탈".
-    if (score <= 0) continue;
+    if (matchScore <= 0) continue;
     results.push({
       appid: g.appid,
       name: g.name,
@@ -408,7 +605,10 @@ export function recommendLibraryUnplayed(
       isFree: g.isFree,
       matchedGenres,
       matchedCategories,
-      score,
+      matchScore,
+      // 단계 1(매칭 전용): 최종 score = matchScore. 리뷰 블렌딩은 라우트가 shortlist에
+      // 대해 blendRecommendations로 후처리하며 score를 덮어쓴다.
+      score: matchScore,
       source: "library-unplayed",
       playtimeMinutes: g.playtimeMinutes,
     });
@@ -421,7 +621,9 @@ export function recommendLibraryUnplayed(
     if (bp !== ap) return bp - ap;
     return a.appid - b.appid;
   });
-  return results.slice(0, opts.maxRecommendationsPerTrack);
+  // limit: 기본은 maxRecommendationsPerTrack. 라우트가 리뷰 블렌딩용 shortlist를
+  // 뽑을 때는 더 큰 값(shortlist 크기)을 넘겨 상위 후보를 넉넉히 확보한다.
+  return results.slice(0, limit);
 }
 
 /**
@@ -437,13 +639,15 @@ export function recommendLibraryUnplayed(
 export function recommendFromWishlist(
   wishlist: WishlistAnalyzedGame[],
   profile: TasteProfile,
-  opts: AnalyzeOptions
+  opts: AnalyzeOptions,
+  limit: number = opts.maxRecommendationsPerTrack
 ): Recommendation[] {
+  const profileNorm = computeProfileNorm(profile);
   const results: Recommendation[] = [];
   for (const g of wishlist) {
     if (opts.excludeFree && g.isFree) continue;
-    const { score, matchedGenres, matchedCategories } = scoreAgainstProfile(g, profile);
-    if (score <= 0) continue;
+    const { matchScore, matchedGenres, matchedCategories } = scoreAgainstProfile(g, profile, profileNorm);
+    if (matchScore <= 0) continue;
     results.push({
       appid: g.appid,
       name: g.name,
@@ -451,9 +655,12 @@ export function recommendFromWishlist(
       isFree: g.isFree,
       matchedGenres,
       matchedCategories,
-      score,
+      matchScore,
+      // 단계 1(매칭 전용): 최종 score = matchScore. 리뷰 블렌딩은 라우트가 후처리.
+      score: matchScore,
       source: "wishlist",
       wishlistPriority: g.priority,
+      wishlistDateAdded: g.dateAddedUnix,
     });
   }
   // 위시리스트는 후처리에서 priority 활용 가능하도록 원본 priority/dateAdded 유지
@@ -469,7 +676,7 @@ export function recommendFromWishlist(
     if (bd !== ad) return bd - ad;
     return a.appid - b.appid;
   });
-  return results.slice(0, opts.maxRecommendationsPerTrack);
+  return results.slice(0, limit);
 }
 
 // ============================================================================

@@ -20,7 +20,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import ThemeToggle from '@/components/ThemeToggle';
 import ProgressBar from '@/components/ProgressBar';
-import { DEFAULT_ANALYZE_OPTIONS, type AnalyzeOptions, type TasteProfile, type Recommendation } from '@/lib/steam/profile';
+import { DEFAULT_ANALYZE_OPTIONS, type AnalyzeOptions, type TasteProfile, type Recommendation, type ReviewBadge } from '@/lib/steam/profile';
 
 // UI default = lib default + 사용자 친화적 override.
 // lib의 DEFAULT_ANALYZE_OPTIONS를 그대로 import해 미래 옵션 필드 추가/기본값
@@ -362,9 +362,10 @@ function RecommendContent() {
 
 function phaseLabel(phase: string): string {
   switch (phase) {
-    case 'fetching-meta': return '게임 메타 정보 수집 중';
-    case 'analyzing':     return '성향 분석 중';
-    default:              return phase;
+    case 'fetching-meta':    return '게임 메타 정보 수집 중';
+    case 'fetching-reviews': return '리뷰 평가 수집 중';
+    case 'analyzing':        return '성향 분석 중';
+    default:                 return phase;
   }
 }
 
@@ -702,15 +703,62 @@ function RecommendCard({ rec }: { rec: Recommendation }) {
             </span>
           ))}
         </div>
-        <div className="text-xs text-gray-500 dark:text-gray-400">
-          {rec.source === 'library-unplayed' && (
-            rec.playtimeMinutes === 0
-              ? '아직 안 해본 게임'
-              : `${rec.playtimeMinutes}분 플레이`
-          )}
-          {rec.source === 'wishlist' && '위시리스트'}
+        <div className="flex items-center justify-between gap-2 text-xs text-gray-500 dark:text-gray-400">
+          <span>
+            {rec.source === 'library-unplayed' && (
+              rec.playtimeMinutes === 0
+                ? '아직 안 해본 게임'
+                : `${rec.playtimeMinutes}분 플레이`
+            )}
+            {rec.source === 'wishlist' && '위시리스트'}
+          </span>
+          {rec.reviewBadge && <ReviewBadgeChip badge={rec.reviewBadge} />}
         </div>
       </div>
     </a>
   );
+}
+
+/** 저표본 기준: 이 미만이면 호평 %를 단정하지 않고 표본 수만 노출한다. */
+const REVIEW_BADGE_MIN_SAMPLE = 10;
+
+/**
+ * 호평률 배지 칩.
+ *
+ * 정직성 원칙:
+ *   - 표본이 REVIEW_BADGE_MIN_SAMPLE 미만이면 %가 신뢰할 수 없으므로 중립 회색으로
+ *     "리뷰 N개"만 표시(감정 라벨 없음).
+ *   - 충분하면 percent에서 한국어 감정 라벨/색상을 파생(Steam desc 언어에 의존하지 않음)
+ *     하고 표본 수를 함께 노출해 사용자가 신뢰도를 판단하게 한다.
+ */
+function ReviewBadgeChip({ badge }: { badge: ReviewBadge }) {
+  const count = badge.totalReviews.toLocaleString('ko-KR');
+  if (badge.totalReviews < REVIEW_BADGE_MIN_SAMPLE) {
+    return (
+      <span
+        className="shrink-0 px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
+        title={`리뷰 ${count}개 — 표본이 적어 호평률을 표시하지 않습니다`}
+      >
+        리뷰 {count}
+      </span>
+    );
+  }
+  const { label, className } = reviewBadgeStyle(badge.positivePercent);
+  return (
+    <span
+      className={`shrink-0 px-1.5 py-0.5 rounded font-medium ${className}`}
+      title={`${label} · 호평 ${badge.positivePercent}% (리뷰 ${count}개)`}
+    >
+      {label} {badge.positivePercent}%
+    </span>
+  );
+}
+
+/** 호평 %를 한국어 감정 라벨 + Tailwind 색상 클래스로 매핑 (Steam 등급 구간 근사). */
+function reviewBadgeStyle(percent: number): { label: string; className: string } {
+  if (percent >= 80) return { label: '매우 긍정적', className: 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300' };
+  if (percent >= 70) return { label: '대체로 긍정적', className: 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400' };
+  if (percent >= 40) return { label: '복합적', className: 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300' };
+  if (percent >= 20) return { label: '대체로 부정적', className: 'bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300' };
+  return { label: '매우 부정적', className: 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300' };
 }

@@ -204,6 +204,21 @@ export interface SteamReviewsResponse {
   reviews: SteamReview[];
 }
 
+/**
+ * appreviews query_summary의 집계 호평률 요약.
+ * getReviewSummary가 반환하며 /recommend 추천의 리뷰 블렌딩(작업 지시서 단계 2)에 사용.
+ * review_score_desc/reviewScore(0~10 등급)는 향후 UI 배지용으로 함께 보존한다.
+ */
+export interface ReviewSummary {
+  /** Steam 리뷰 점수 등급 (0~10). 표본 수 미반영이라 랭킹엔 직접 안 쓰고 표시용. */
+  reviewScore: number;
+  /** 등급 설명 (예: "Very Positive" / "매우 긍정적"). */
+  reviewScoreDesc: string;
+  totalPositive: number;
+  totalNegative: number;
+  totalReviews: number;
+}
+
 // --- ISteamUser/ResolveVanityURL ---
 
 export interface SteamVanityUrlResponse {

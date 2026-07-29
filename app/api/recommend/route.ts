@@ -33,9 +33,10 @@
 
 import { NextRequest } from "next/server";
 import { getSession } from "@/lib/session";
-import { getOwnedGames, getWishlist, getAppDetailsBatch } from "@/lib/steam/api";
+import { getOwnedGames, getWishlist, getAppDetailsBatch, getReviewSummary } from "@/lib/steam/api";
 import { rateLimitResponse } from "@/lib/rate-limit";
 import { logEvent } from "@/lib/logger";
+import { STREAM_CONCURRENCY } from "@/lib/constants";
 import {
   analyzeTaste,
   recommendLibraryUnplayed,
@@ -43,12 +44,15 @@ import {
   buildOwnedAnalyzedGame,
   buildWishlistAnalyzedGame,
   validateAnalyzeOptions,
+  computeReviewScore,
+  blendRecommendations,
+  buildReviewBadge,
   DEFAULT_ANALYZE_OPTIONS,
   type AnalyzeOptions,
   type TasteProfile,
   type Recommendation,
 } from "@/lib/steam/profile";
-import type { SteamAppDetails, SteamOwnedGame, SteamWishlistItem } from "@/lib/steam/types";
+import type { SteamAppDetails, SteamOwnedGame, SteamWishlistItem, ReviewSummary } from "@/lib/steam/types";
 import {
   getRecommendationCache,
   setRecommendationCache,
@@ -71,6 +75,17 @@ const PARTIAL_EMIT_INTERVAL_MS = 3000;
  * 첫 후보가 나타나는 시점이 뒤로 밀린다.
  */
 const PROFILE_SEED_COUNT = 20;
+
+/**
+ * 리뷰 블렌딩 shortlist 크기 = min(maxRecommendationsPerTrack · MULTIPLIER, CAP).
+ *
+ * 리뷰 요약 조회는 per-후보 API 호출(500ms 직렬)이므로 전체 후보가 아니라 매칭 점수
+ * 상위 shortlist에만 건다. MULTIPLIER=2로 최종 노출(maxPerTrack)보다 넉넉히 뽑아
+ * 리뷰 블렌딩이 순위를 뒤집을 여지를 주되, CAP=30으로 트랙당 상한을 고정한다.
+ * (트랙 2개 × 30 = 최대 60 fetch × 500ms ≈ 30초, 캐시 미스 전량 시. 작업 지시서 2-4)
+ */
+const REVIEW_SHORTLIST_MULTIPLIER = 2;
+const REVIEW_SHORTLIST_CAP = 30;
 
 export const dynamic = "force-dynamic";
 
@@ -177,13 +192,51 @@ function computeRecommendations(
   detailsMap: ReadonlyMap<number, SteamAppDetails | null>,
   tracks: { lib: boolean; wish: boolean },
   options: AnalyzeOptions,
+  /**
+   * 트랙별 반환 개수 상한. 기본은 maxRecommendationsPerTrack(=최종 노출 수).
+   * 최종 분석에서 리뷰 블렌딩용 shortlist를 뽑을 때는 더 큰 값을 넘긴다.
+   */
+  limit: number = options.maxRecommendationsPerTrack,
 ) {
   const analyzedOwned = owned.map(g => buildOwnedAnalyzedGame(g, detailsMap.get(g.appid) ?? null));
   const analyzedWishlist = wishlist.map(w => buildWishlistAnalyzedGame(w, detailsMap.get(w.appid) ?? null));
   const profile = analyzeTaste(analyzedOwned, options);
-  const libraryUnplayed = tracks.lib ? recommendLibraryUnplayed(analyzedOwned, profile, options) : [];
-  const wishlistRecs = tracks.wish ? recommendFromWishlist(analyzedWishlist, profile, options) : [];
+  const libraryUnplayed = tracks.lib ? recommendLibraryUnplayed(analyzedOwned, profile, options, limit) : [];
+  const wishlistRecs = tracks.wish ? recommendFromWishlist(analyzedWishlist, profile, options, limit) : [];
   return { profile, libraryUnplayed, wishlist: wishlistRecs };
+}
+
+/**
+ * shortlist appid들의 리뷰 호평률 요약을 캐시 우선으로 직렬 조회한다.
+ *
+ * getAppDetailsBatch(`lib/steam/api.ts:517`)와 동일한 취소·배치 패턴:
+ *   STREAM_CONCURRENCY 단위 배치, 매 배치 시작 전 isCancelled 검사.
+ *   getReviewSummary 자체가 500ms 딜레이 + 캐시를 내장하므로 여기선 배치만 담당.
+ *
+ * @returns Map<appid, ReviewSummary | null>. null이면 조회 실패(호출 측이 중립 0.5로 흡수).
+ */
+async function fetchReviewSummaries(
+  appIds: number[],
+  onProgress: (loaded: number, total: number) => void,
+  isCancelled: () => boolean,
+): Promise<Map<number, ReviewSummary | null>> {
+  const result = new Map<number, ReviewSummary | null>();
+  const total = appIds.length;
+  let loaded = 0;
+
+  for (let i = 0; i < appIds.length; i += STREAM_CONCURRENCY) {
+    if (isCancelled()) return result;
+    const batch = appIds.slice(i, i + STREAM_CONCURRENCY);
+    const settled = await Promise.allSettled(batch.map(id => getReviewSummary(id)));
+    for (let j = 0; j < batch.length; j++) {
+      const r = settled[j];
+      result.set(batch[j], r.status === "fulfilled" ? r.value : null);
+      loaded++;
+      onProgress(loaded, total);
+      if (isCancelled()) return result;
+    }
+  }
+  return result;
 }
 
 /**
@@ -308,7 +361,10 @@ async function runAnalysis(
    *     사용자에게 보여줄 가치가 있다. analyzedGames=0(=analysisInsufficient)
    *     이거나 모든 차원 비어있음(=metaMissingDominant)이면 차단.
    *     partial/final 동일 정책.
-   *   - !wishlistFetchFailed — 위시리스트 일시 장애를 cache에 굳히지 않음.
+   *   - !(tracks.wish && wishlistFetchFailed) — 위시리스트 일시 장애를 cache에
+   *     굳히지 않음. 단 위시리스트 트랙이 꺼진(tracks.wish=false) 요청은 위시리스트
+   *     결과 자체를 보여주지 않으므로 장애가 무의미 → 라이브러리 결과만이라도 캐시한다.
+   *     (트랙 조합은 optionsHash에 포함되어 wish=off 캐시가 wish=on 뷰로 새지 않는다.)
    *     (이전엔 final write에서만 검사하여 partial이 wishlistFetchFailed=false
    *     를 거짓으로 박는 회귀가 있었음 — 이제 통합 helper가 한 번에 처리.)
    *   - 중복 dedupe — 같은 모양의 payload를 연속 쓰지 않음 (force=false인 경우).
@@ -325,7 +381,8 @@ async function runAnalysis(
     force = false,
   ): void {
     if (isCancelled()) return;
-    if (wishlistFetchFailed) return;
+    // 위시리스트 트랙이 켜져 있을 때만 위시리스트 장애로 캐시를 막는다.
+    if (tracks.wish && wishlistFetchFailed) return;
     if (profile.analyzedGames === 0) return;
     if (profile.genres.length === 0 && profile.categories.length === 0) return;
 
@@ -343,8 +400,10 @@ async function runAnalysis(
         wishlist: wishlistRecs,
         ownedGames: owned.length,
         wishlistGames: wishlist.length,
-        // wishlistFetchFailed는 위 가드에서 false임을 보장 — 실제 값을 그대로 저장.
-        wishlistFetchFailed,
+        // wish 트랙이 켜져 있으면 위 가드에서 wishlistFetchFailed=false가 보장된다.
+        // wish 트랙이 꺼진 경우엔 위시리스트 장애가 이 뷰와 무관하므로 false로 저장
+        // (cached 수신 시 클라이언트가 위시리스트 실패 배너를 잘못 띄우지 않도록).
+        wishlistFetchFailed: tracks.wish && wishlistFetchFailed,
       });
       lastWrittenSignature = sig;
     } catch (err) {
@@ -434,11 +493,70 @@ async function runAnalysis(
 
   if (isCancelled()) return;
 
-  // 4. 최종 분석 (입력은 동일 함수)
+  // 4. 최종 분석 — 매칭 점수 기준 shortlist 산출 (블렌딩 재랭킹 여지를 위해 넉넉히).
   controller.enqueue(sseEvent("progress", { phase: "analyzing", loaded: total, total }));
 
-  const { profile, libraryUnplayed, wishlist: wishlistRecs } =
-    computeRecommendations(owned, wishlist, detailsMap, tracks, options);
+  const shortlistSize = Math.min(
+    options.maxRecommendationsPerTrack * REVIEW_SHORTLIST_MULTIPLIER,
+    REVIEW_SHORTLIST_CAP,
+  );
+  const shortlisted = computeRecommendations(owned, wishlist, detailsMap, tracks, options, shortlistSize);
+  const profile = shortlisted.profile;
+
+  if (isCancelled()) return;
+
+  // 4b. 리뷰 호평률 블렌딩 (작업 지시서 단계 2).
+  //   - shortlist의 appid를 두 트랙 합쳐 dedupe → 리뷰 요약을 한 번씩만 조회.
+  //     (라이브러리/위시리스트는 uniqueIds 산출에서 이미 배타적이지만 안전하게 dedupe)
+  //   - final result에서만 블렌딩. partial-result는 match-only로 두어 스트리밍 중
+  //     per-후보 리뷰 fetch 비용을 피한다. → 순위가 partial→final에서 바뀔 수 있으나
+  //     final write는 force=true라 캐시 computed_at이 정상 갱신됨.
+  //   - 조회 실패/미포함 후보는 blendRecommendations 내부에서 중립 0.5로 흡수(탈락 없음).
+  // uniqueIds 산출(위 wishlistIdsOnly 필터)에서 두 트랙의 appid는 이미 배타적이라
+  // 실제 중복은 없다. new Set은 안전망 — 향후 산출 로직이 바뀌어 겹쳐도 리뷰 요약을
+  // appid당 한 번만 조회하도록 보장한다.
+  const reviewAppIds = Array.from(new Set([
+    ...shortlisted.libraryUnplayed.map(r => r.appid),
+    ...shortlisted.wishlist.map(r => r.appid),
+  ]));
+
+  let libraryUnplayed: Recommendation[];
+  let wishlistRecs: Recommendation[];
+
+  if (reviewAppIds.length > 0) {
+    controller.enqueue(sseEvent("progress", { phase: "fetching-reviews", loaded: 0, total: reviewAppIds.length }));
+    const summaryMap = await fetchReviewSummaries(
+      reviewAppIds,
+      (loaded, t) => {
+        if (loaded % 5 === 0 || loaded === t) {
+          try {
+            controller.enqueue(sseEvent("progress", { phase: "fetching-reviews", loaded, total: t }));
+          } catch { /* closed */ }
+        }
+      },
+      isCancelled,
+    );
+    if (isCancelled()) return;
+
+    const reviewScoreByAppid = new Map<number, number>(
+      reviewAppIds.map(id => [id, computeReviewScore(summaryMap.get(id) ?? null)]),
+    );
+    // 블렌딩(랭킹) 후 최종 노출 카드에만 표시용 호평률 배지를 부착한다.
+    //   - 랭킹은 정규화 reviewScore로, 배지는 실제 호평 %로 (buildReviewBadge).
+    //   - 요약 조회 실패(summary=null)인 후보는 배지 없이 통과.
+    //   - truncate 후 결과(≤maxPerTrack)에만 map하므로 비용 미미.
+    const attachBadges = (recs: Recommendation[]): Recommendation[] =>
+      recs.map(r => {
+        const badge = buildReviewBadge(summaryMap.get(r.appid) ?? null);
+        return badge ? { ...r, reviewBadge: badge } : r;
+      });
+    libraryUnplayed = attachBadges(blendRecommendations(shortlisted.libraryUnplayed, reviewScoreByAppid, options.maxRecommendationsPerTrack));
+    wishlistRecs = attachBadges(blendRecommendations(shortlisted.wishlist, reviewScoreByAppid, options.maxRecommendationsPerTrack));
+  } else {
+    // 매칭 후보가 하나도 없으면(shortlist 빈 배열) 리뷰 조회 생략. 그대로 truncate.
+    libraryUnplayed = shortlisted.libraryUnplayed.slice(0, options.maxRecommendationsPerTrack);
+    wishlistRecs = shortlisted.wishlist.slice(0, options.maxRecommendationsPerTrack);
+  }
 
   if (isCancelled()) return;
 
@@ -460,7 +578,11 @@ async function runAnalysis(
     ownedGames: owned.length,
     wishlistGames: wishlist.length,
     cacheHitRate: 0,
-    wishlistFetchFailed,
+    // 위시리스트 트랙이 켜져 있을 때만 위시리스트 장애를 보고한다. wish=off 요청은
+    // 위시리스트 결과를 보여주지 않으므로 장애가 무의미 — false로 내려 클라이언트가
+    // '위시리스트 조회 실패' 배너를 잘못 띄우지 않도록. tryWriteCache의 캐시 저장
+    // 정책(tracks.wish && wishlistFetchFailed)과 동일하게 맞춰 live/cached 경로 일관.
+    wishlistFetchFailed: tracks.wish && wishlistFetchFailed,
     analysisInsufficient,
     metaMissingDominant,
     libraryFetchFailed: false,

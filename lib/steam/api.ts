@@ -30,6 +30,7 @@ import type {
   SteamPriceOverview,
   SteamReview,
   SteamReviewsResponse,
+  ReviewSummary,
   SteamVanityUrlResponse,
   SteamStoreSearchItem,
   SteamStoreSearchResponse,
@@ -456,6 +457,53 @@ export async function getReviews(
   const reviews = res.reviews;
   cacheSet(cacheKey, reviews, CACHE_TTL.reviews);
   return { data: reviews, isStale: false };
+}
+
+/**
+ * 게임의 리뷰 호평률 요약(query_summary)을 조회한다.
+ * store.steampowered.com/appreviews/{appid} (공식 문서화 API)
+ *
+ * getReviews와 목적이 다르다: 본문 리뷰가 아니라 전체 기간 누적 집계
+ * (total_positive/total_negative/total_reviews)만 필요하므로
+ *   - num_per_page=0 : 본문 리뷰 0개 요청 → 페이로드 최소화
+ *   - filter=all     : 전체 기간 누적 요약 (getReviews의 filter=recent는 롤링 요약이라 부적합)
+ * 로 호출한다. /recommend 추천 랭킹의 리뷰 블렌딩(작업 지시서 단계 2)에 사용.
+ *
+ * 캐시: `reviewsummary:{appId}` 키 + CACHE_TTL.reviewSummary(6h). getReviews의
+ *   `reviews:*` 키와 분리하여 서로 무효화에 영향 주지 않는다.
+ *
+ * Rate Limit: reviews 딜레이(500ms) 적용.
+ *
+ * @param appId 게임 AppID
+ * @returns 요약. 조회 실패 / success!==1 / query_summary 누락(num_per_page=0 미지원 등)
+ *   시 null. 호출 측은 null을 중립(0.5)으로 흡수한다.
+ */
+export async function getReviewSummary(appId: number): Promise<ReviewSummary | null> {
+  const cacheKey = `reviewsummary:${appId}`;
+  const cached = cacheGet<ReviewSummary>(cacheKey);
+  if (cached) return cached.data;
+
+  await delay(STEAM_API_DELAY.reviews);
+
+  const url =
+    `${STEAM_STORE_BASE}/appreviews/${appId}?json=1` +
+    `&num_per_page=0&language=all&purchase_type=all&filter=all`;
+
+  const res = await fetchJson<SteamReviewsResponse>(url);
+
+  // success 플래그 또는 query_summary 누락 시 조회 실패로 처리 (getReviews:454 패턴).
+  if (!res || res.success !== 1 || !res.query_summary) return null;
+
+  const qs = res.query_summary;
+  const summary: ReviewSummary = {
+    reviewScore: qs.review_score,
+    reviewScoreDesc: qs.review_score_desc,
+    totalPositive: qs.total_positive,
+    totalNegative: qs.total_negative,
+    totalReviews: qs.total_reviews,
+  };
+  cacheSet(cacheKey, summary, CACHE_TTL.reviewSummary);
+  return summary;
 }
 
 /**

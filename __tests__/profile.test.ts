@@ -19,10 +19,16 @@ import {
   recommendFromWishlist,
   validateAnalyzeOptions,
   classify,
+  computeReviewScore,
+  buildReviewBadge,
+  blendRecommendations,
+  W_MATCH,
+  W_REVIEW,
   DEFAULT_ANALYZE_OPTIONS,
   type OwnedAnalyzedGame,
   type WishlistAnalyzedGame,
   type AnalyzeOptions,
+  type Recommendation,
 } from "@/lib/steam/profile";
 
 // ============================================================================
@@ -428,5 +434,226 @@ describe("케이스 15: id 기반 매칭, 표시 label은 첫 등장", () => {
     expect(recs).toHaveLength(1);
     // 후보가 가진 label "액션"을 노출 (사용자가 보기에 같은 페이지의 다른 카드와 일관)
     expect(recs[0].matchedGenres[0].label).toBe("액션");
+  });
+});
+
+// ============================================================================
+// 케이스 16: 코사인 정규화 — 다태그 편향 제거 (작업 지시서 단계 1, 케이스 A)
+// ============================================================================
+
+describe("케이스 16: 코사인 정규화 다태그 편향 제거", () => {
+  it("동일 매칭(G1,G2)이면 태그 수 많은 후보가 ‖b‖ 패널티로 더 낮은 matchScore", () => {
+    // 프로필: 장르 G1(share 0.6), G2(share 0.4) 형성.
+    //   두 장르에 서로 다른 가중치를 주려고 playtime을 다르게 설정한다.
+    //   (share 절대값은 검증 대상이 아니라 X/Y 상대 순위만 본다)
+    const g1Signal = owned({ appid: 900, playtime: 60000, genreIds: ["G1"] }); // 큰 가중
+    const g2Signal = owned({ appid: 901, playtime: 600, genreIds: ["G2"] });   // 작은 가중
+    // 후보 X: 2태그(G1,G2 둘 다 매칭). 후보 Y: 6태그(G1,G2 매칭 + 프로필 밖 N1~N4).
+    const x = owned({ appid: 1, playtime: 0, genreIds: ["G1", "G2"] });
+    const y = owned({ appid: 2, playtime: 0, genreIds: ["G1", "G2", "N1", "N2", "N3", "N4"] });
+    const games = [g1Signal, g2Signal, x, y];
+    const profile = analyzeTaste(games, opts());
+    const recs = recommendLibraryUnplayed(games, profile, opts());
+    const rx = recs.find(r => r.appid === 1)!;
+    const ry = recs.find(r => r.appid === 2)!;
+    expect(rx).toBeDefined();
+    expect(ry).toBeDefined();
+    // dot은 동일(G1,G2 share 합)이나 ‖b_X‖=√2 < ‖b_Y‖=√6 → X가 우위.
+    expect(rx.matchScore).toBeGreaterThan(ry.matchScore);
+    // 정렬 결과도 X가 Y보다 앞.
+    expect(recs.findIndex(r => r.appid === 1)).toBeLessThan(recs.findIndex(r => r.appid === 2));
+  });
+});
+
+// ============================================================================
+// 케이스 17: 코사인 [0,1] 유계 — 카테고리 편중 (작업 지시서 케이스 B, C-NEW 회귀)
+// ============================================================================
+
+describe("케이스 17: matchScore [0,1] 유계 (카테고리 포함)", () => {
+  it("카테고리 단일 차원 완전 정렬 시 matchScore=1.0 (3.33 폭주 회귀 가드)", () => {
+    // 프로필: 카테고리 C1만 (share=1.0), 장르 없음.
+    const signal = owned({ appid: 900, playtime: 1000, categoryIds: [1] });
+    // 후보 Z: 카테고리 C1만 → dot=W_CAT, ‖a‖=W_CAT, ‖b‖=1 → matchScore=1.0.
+    const z = owned({ appid: 1, playtime: 0, categoryIds: [1] });
+    const games = [signal, z];
+    const profile = analyzeTaste(games, opts());
+    const recs = recommendLibraryUnplayed(games, profile, opts());
+    const rz = recs.find(r => r.appid === 1)!;
+    expect(rz).toBeDefined();
+    // dot의 W_CAT¹와 norm의 W_CAT²가 어긋나면 여기서 3.33이 되어 실패한다.
+    expect(rz.matchScore).toBeCloseTo(1.0, 9);
+  });
+
+  it("장르+카테고리 혼합 매칭도 matchScore ≤ 1.0", () => {
+    const games = [
+      owned({ appid: 900, playtime: 1000, genreIds: ["A", "B"], categoryIds: [1, 2] }),
+      owned({ appid: 901, playtime: 2000, genreIds: ["B", "C"], categoryIds: [2, 3] }),
+      owned({ appid: 1, playtime: 0, genreIds: ["A", "B", "C"], categoryIds: [1, 2, 3] }),
+    ];
+    const profile = analyzeTaste(games, opts());
+    const recs = recommendLibraryUnplayed(games, profile, opts());
+    for (const r of recs) {
+      expect(r.matchScore).toBeGreaterThan(0);
+      expect(r.matchScore).toBeLessThanOrEqual(1.0 + 1e-9);
+    }
+  });
+});
+
+// ============================================================================
+// 케이스 18: computeReviewScore — 호평률 정규화 (작업 지시서 2-2)
+// ============================================================================
+
+describe("케이스 18: computeReviewScore", () => {
+  it("요약 없음/표본 0 → 중립 0.5", () => {
+    expect(computeReviewScore(null)).toBe(0.5);
+    expect(computeReviewScore({ totalPositive: 0, totalReviews: 0 })).toBe(0.5);
+  });
+  it("표본 충분(≥50) 100% 호평 → 1.0, 0% 호평 → 0.0", () => {
+    expect(computeReviewScore({ totalPositive: 100, totalReviews: 100 })).toBeCloseTo(1.0, 9);
+    expect(computeReviewScore({ totalPositive: 0, totalReviews: 100 })).toBeCloseTo(0.0, 9);
+  });
+  it("표본 부족(10개) 100% 호평 → confidence=0.2로 0.5쪽 수축 (0.6)", () => {
+    // positiveRatio=1.0, confidence=10/50=0.2 → 0.5 + 0.5·0.2 = 0.6
+    expect(computeReviewScore({ totalPositive: 10, totalReviews: 10 })).toBeCloseTo(0.6, 9);
+  });
+  it("모든 반환값이 [0,1] 유계", () => {
+    const cases = [
+      { totalPositive: 3, totalReviews: 7 },
+      { totalPositive: 45, totalReviews: 50 },
+      { totalPositive: 1, totalReviews: 1000 },
+    ];
+    for (const c of cases) {
+      const s = computeReviewScore(c);
+      expect(s).toBeGreaterThanOrEqual(0);
+      expect(s).toBeLessThanOrEqual(1);
+    }
+  });
+  it("totalPositive > totalReviews(이상 데이터)여도 [0,1] 클램프 (code-review #1)", () => {
+    // Steam filter=all이 total_reviews < total_positive를 줄 수 있는 케이스.
+    // positiveRatio=1.2 → 클램프 1.0 → 0.5+(1.0-0.5)*1.0 = 1.0
+    const s = computeReviewScore({ totalPositive: 120, totalReviews: 100 });
+    expect(s).toBeLessThanOrEqual(1);
+    expect(s).toBeCloseTo(1.0, 9);
+  });
+});
+
+// ============================================================================
+// 케이스 20: buildReviewBadge — 표시용 배지 (UI 호평률 배지)
+// ============================================================================
+
+describe("케이스 20: buildReviewBadge", () => {
+  const summary = (totalPositive: number, totalReviews: number) => ({
+    reviewScore: 0,
+    reviewScoreDesc: "",
+    totalPositive,
+    totalNegative: totalReviews - totalPositive,
+    totalReviews,
+  });
+
+  it("요약 없음/표본 0 → null (배지 미표시)", () => {
+    expect(buildReviewBadge(null)).toBeNull();
+    expect(buildReviewBadge(summary(0, 0))).toBeNull();
+  });
+  it("호평 비율을 반올림 %로, 표본 수를 그대로 담는다", () => {
+    // 920/1000 = 92%
+    expect(buildReviewBadge(summary(920, 1000))).toEqual({ positivePercent: 92, totalReviews: 1000 });
+    // 2/3 = 66.67 → 67 (반올림)
+    expect(buildReviewBadge(summary(2, 3))).toEqual({ positivePercent: 67, totalReviews: 3 });
+    // 100% / 0%
+    expect(buildReviewBadge(summary(50, 50))!.positivePercent).toBe(100);
+    expect(buildReviewBadge(summary(0, 40))!.positivePercent).toBe(0);
+  });
+  it("totalPositive > totalReviews여도 positivePercent ≤ 100 클램프 (code-review #1)", () => {
+    // 클램프 없으면 '호평 120%' 배지가 표시됨.
+    expect(buildReviewBadge(summary(120, 100))!.positivePercent).toBe(100);
+  });
+});
+
+// ============================================================================
+// 케이스 19: blendRecommendations — 리뷰 블렌딩 재랭킹 (작업 지시서 2-3/2-4)
+// ============================================================================
+
+describe("케이스 19: blendRecommendations", () => {
+  const rec = (args: Partial<Recommendation> & { appid: number; matchScore: number }): Recommendation => ({
+    name: `Game ${args.appid}`,
+    isFree: false,
+    matchedGenres: [],
+    matchedCategories: [],
+    score: args.matchScore, // 기본 score = matchScore. args에 score 있으면 스프레드가 덮음
+    source: "library-unplayed",
+    playtimeMinutes: 0,
+    // appid, matchScore(및 명시된 나머지)는 스프레드로 주입 — 중복 지정 없이 오버라이드
+    ...args,
+  });
+
+  it("finalScore = W_MATCH·matchScore + W_REVIEW·reviewScore, reviewScore 채워짐", () => {
+    const shortlist = [rec({ appid: 1, matchScore: 0.8 })];
+    const reviewScores = new Map<number, number>([[1, 0.4]]);
+    const out = blendRecommendations(shortlist, reviewScores, 10);
+    expect(out).toHaveLength(1);
+    expect(out[0].reviewScore).toBe(0.4);
+    expect(out[0].score).toBeCloseTo(W_MATCH * 0.8 + W_REVIEW * 0.4, 9);
+  });
+
+  it("리뷰 점수가 순위를 뒤집을 수 있다 (매칭 근소 열위 + 호평 우위)", () => {
+    // A: matchScore 0.60, review 0.95 → 0.65·0.6 + 0.35·0.95 = 0.7225
+    // B: matchScore 0.62, review 0.30 → 0.65·0.62 + 0.35·0.30 = 0.508
+    const shortlist = [
+      rec({ appid: 1, matchScore: 0.60 }),
+      rec({ appid: 2, matchScore: 0.62 }),
+    ];
+    const reviewScores = new Map<number, number>([[1, 0.95], [2, 0.30]]);
+    const out = blendRecommendations(shortlist, reviewScores, 10);
+    // 원래 matchScore로는 B(2)가 앞이지만, 블렌딩 후 A(1)가 앞선다.
+    expect(out.map(r => r.appid)).toEqual([1, 2]);
+  });
+
+  it("맵에 없는 후보는 중립 0.5로 흡수 (탈락 없음)", () => {
+    const shortlist = [rec({ appid: 1, matchScore: 0.8 })];
+    const out = blendRecommendations(shortlist, new Map(), 10);
+    expect(out).toHaveLength(1);
+    expect(out[0].reviewScore).toBe(0.5);
+    expect(out[0].score).toBeCloseTo(W_MATCH * 0.8 + W_REVIEW * 0.5, 9);
+  });
+
+  it("limit로 truncate", () => {
+    const shortlist = [1, 2, 3, 4, 5].map(i => rec({ appid: i, matchScore: 0.9 - i * 0.1 }));
+    const out = blendRecommendations(shortlist, new Map(), 3);
+    expect(out).toHaveLength(3);
+  });
+
+  it("동점 시 2차 tiebreak: library는 playtime 내림차순, appid 오름차순", () => {
+    // 동일 matchScore + 동일 reviewScore(맵 없음→0.5) → score 동점.
+    const shortlist = [
+      rec({ appid: 50, matchScore: 0.7, playtimeMinutes: 0 }),
+      rec({ appid: 30, matchScore: 0.7, playtimeMinutes: 0 }),
+      rec({ appid: 40, matchScore: 0.7, playtimeMinutes: 100 }), // playtime 큼 → 최우선
+    ];
+    const out = blendRecommendations(shortlist, new Map(), 10);
+    expect(out.map(r => r.appid)).toEqual([40, 30, 50]);
+  });
+
+  it("wishlist source는 priority 오름차순으로 tiebreak (자기 source로 키잉, C1 회귀)", () => {
+    // 혼합 source를 한 번에 넣어도 각 항목이 자기 source 기준으로 정렬되는지 검증.
+    const shortlist: Recommendation[] = [
+      rec({ appid: 1, matchScore: 0.5, source: "wishlist", wishlistPriority: 8, playtimeMinutes: undefined }),
+      rec({ appid: 2, matchScore: 0.5, source: "wishlist", wishlistPriority: 2, playtimeMinutes: undefined }),
+      rec({ appid: 3, matchScore: 0.5, source: "wishlist", wishlistPriority: 5, playtimeMinutes: undefined }),
+    ];
+    const out = blendRecommendations(shortlist, new Map(), 10);
+    // priority 낮을수록 우선 → 2, 3, 8
+    expect(out.map(r => r.appid)).toEqual([2, 3, 1]);
+  });
+
+  it("wishlist priority 동률 시 dateAdded 내림차순(최근 추가 우선) tiebreak (code-review #3)", () => {
+    // score·matchScore·priority 모두 동일 → dateAdded로 결정. 최근(큰 값) 우선.
+    const shortlist: Recommendation[] = [
+      rec({ appid: 1, matchScore: 0.5, source: "wishlist", wishlistPriority: 3, wishlistDateAdded: 100, playtimeMinutes: undefined }),
+      rec({ appid: 2, matchScore: 0.5, source: "wishlist", wishlistPriority: 3, wishlistDateAdded: 300, playtimeMinutes: undefined }),
+      rec({ appid: 3, matchScore: 0.5, source: "wishlist", wishlistPriority: 3, wishlistDateAdded: 200, playtimeMinutes: undefined }),
+    ];
+    const out = blendRecommendations(shortlist, new Map(), 10);
+    // dateAdded 300 → 200 → 100
+    expect(out.map(r => r.appid)).toEqual([2, 3, 1]);
   });
 });

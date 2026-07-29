@@ -47,6 +47,7 @@ function samplePayload(): RecommendationCachePayload {
         isFree: false,
         matchedGenres: [{ id: "1", label: "Action" }],
         matchedCategories: [],
+        matchScore: 0.5,
         score: 0.5,
         source: "library-unplayed",
         playtimeMinutes: 10,
