@@ -24,7 +24,9 @@ export type EventType =
   | "filter_change"
   | "search"
   | "load_more"
-  | "recommend_analyze";
+  | "recommend_analyze"
+  | "recommend_cardfarming_skipped"
+  | "recommend_fastmode_capped";
 
 interface LogEntry {
   timestamp: string;

@@ -59,6 +59,7 @@ function buildUrl(opts: AnalyzeOptions): string {
     excludeFree: String(opts.excludeFree),
     topN: String(opts.topNTaste),
     max: String(opts.maxRecommendationsPerTrack),
+    fast: String(opts.fastMode),
     tracks: 'lib,wish',
   });
   return `/api/recommend?${params.toString()}`;
@@ -412,6 +413,15 @@ function OptionsPanel({ options, onChange }: { options: AnalyzeOptions; onChange
             className="w-4 h-4"
           />
           <span className="text-gray-700 dark:text-gray-200">무료 게임 제외</span>
+        </label>
+        <label className="flex items-center gap-2 cursor-pointer" title="대형 라이브러리 첫 분석을 몇 분 내로 줄입니다. 상한 밖 게임은 추천에서 빠질 수 있습니다(캐시 후에는 무관).">
+          <input
+            type="checkbox"
+            checked={options.fastMode}
+            onChange={(e) => onChange({ ...options, fastMode: e.target.checked })}
+            className="w-4 h-4"
+          />
+          <span className="text-gray-700 dark:text-gray-200">빠른 모드</span>
         </label>
         <label className="flex items-center gap-2">
           <span className="text-gray-600 dark:text-gray-300">트랙별 추천 개수</span>

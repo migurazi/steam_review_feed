@@ -87,6 +87,20 @@ const PROFILE_SEED_COUNT = 20;
 const REVIEW_SHORTLIST_MULTIPLIER = 2;
 const REVIEW_SHORTLIST_CAP = 30;
 
+/**
+ * 빠른 모드(fastMode) 조회 상한.
+ *
+ * 첫 분석의 지배적 비용은 미플레이 후보의 메타 조회(게임당 ~1.5초 직렬)다.
+ * 빠른 모드는 이 둘을 상한하여 대형 라이브러리 첫 분석을 수십 분→몇 분으로 줄인다.
+ *   - FAST_CANDIDATE_CAP: 미플레이 후보 수 상한. 후보는 playtime 내림차순으로
+ *     정렬되어 있어 "조금이라도 켜본" 게임이 우선 포함된다(단순 무작위보다 나은 표본).
+ *   - FAST_ANALYZED_CAP: 시드(PROFILE_SEED_COUNT) 외 analyzed-tier 조회 상한.
+ *     성향은 최다 플레이 상위 게임이 대부분 좌우하므로 상한해도 프로필이 크게 안 변한다.
+ * 트레이드오프: 상한 밖 후보는 추천에서 빠진다(완결성 희생). 값은 경험적 조정 대상.
+ */
+const FAST_CANDIDATE_CAP = 150;
+const FAST_ANALYZED_CAP = 80;
+
 export const dynamic = "force-dynamic";
 
 /**
@@ -113,6 +127,7 @@ function parseOptions(params: URLSearchParams): {
     excludeFree: params.get("excludeFree") === "true",
     topNTaste: num("topN", DEFAULT_ANALYZE_OPTIONS.topNTaste, 1, 12),
     maxRecommendationsPerTrack: num("max", DEFAULT_ANALYZE_OPTIONS.maxRecommendationsPerTrack, 1, 30),
+    fastMode: params.get("fast") === "true",
   };
   validateAnalyzeOptions(options);
 
@@ -419,23 +434,68 @@ async function runAnalysis(
     .sort((a, b) => b.playtime_forever - a.playtime_forever || a.appid - b.appid);
   const seed = ownedByPlaytimeDesc.slice(0, PROFILE_SEED_COUNT);
   const seedIdSet = new Set(seed.map(g => g.appid));
-  // 시드 이후 게임을 후보/나머지로 분리
+  // 시드 이후 게임을 후보/analyzed-tier로 분리
   // - 후보: pt ≤ unplayedMaxMinutes (excludeFree는 fetch 단계에서 따지지 않음 — 메타
   //   없이는 isFree를 모르므로. 분석/추천 단계의 classify가 정확히 거른다.)
-  // - 나머지: card-farming 구간 + 시드 외 analyzed-tier
+  // - analyzed-tier: pt ≥ cardFarmingMaxMinutes (성향 신호에 기여, 시드 외)
+  //
+  // 카드팜 구간(unplayedMax < pt < cardFarmingMax)은 조회 목록에서 **제외**한다.
+  // 이 구간 게임은 classify가 playtime만으로 'card-farming'으로 판정해 분석·추천
+  // 양쪽에서 배제하므로 메타(장르/카테고리)가 전혀 필요 없다. 첫 분석의 메타 조회
+  // (게임당 ~1.5초 직렬)를 줄이는 무료·안전 최적화 — 추천 결과는 불변이다.
+  //   주의: excludeFree=true + 무료인 카드팜 게임은 메타 없이는 isFree를 몰라
+  //   excludedFree 대신 cardFarmingExcluded로 집계된다(둘 다 '제외'라 추천엔 무영향,
+  //   진단 카운트만 미세 이동). 이 희귀 교집합의 정확도를 위해 수천 건을 더 조회할
+  //   가치는 없다.
   const afterSeed = ownedByPlaytimeDesc.filter(g => !seedIdSet.has(g.appid));
-  const candidates = afterSeed.filter(g => g.playtime_forever <= options.unplayedMaxMinutes);
-  const remaining = afterSeed.filter(g => g.playtime_forever > options.unplayedMaxMinutes);
+  const candidatesAll = afterSeed.filter(g => g.playtime_forever <= options.unplayedMaxMinutes);
+  // analyzed-tier: classify의 'analyzed'와 정확히 일치 (pt ≥ cardFarmingMax AND pt >
+  // unplayedMax). `pt > unplayedMax` 조건은 두 슬라이더가 같을 때(cardFarmingMax ==
+  // unplayedMax) 경계 게임이 candidates와 겹쳐 이중 집계되는 것을 막는다.
+  const analyzedRestAll = afterSeed.filter(
+    g => g.playtime_forever >= options.cardFarmingMaxMinutes
+      && g.playtime_forever > options.unplayedMaxMinutes,
+  );
+  // 세 버킷(candidates / analyzedRest / card-farming)은 disjoint하며 afterSeed를
+  // 정확히 덮으므로 skip 수 = 나머지.
+  const cardFarmingSkipped = afterSeed.length - candidatesAll.length - analyzedRestAll.length;
+  // 빠른 모드: 조회 대상을 상한한다. 두 배열 모두 playtime 내림차순이라 slice는
+  // 후보에서 "더 많이 켜본" 게임, analyzed에서 "최다 플레이" 게임을 우선 남긴다.
+  const candidates = options.fastMode ? candidatesAll.slice(0, FAST_CANDIDATE_CAP) : candidatesAll;
+  const analyzedRest = options.fastMode ? analyzedRestAll.slice(0, FAST_ANALYZED_CAP) : analyzedRestAll;
+  const fastModeSkipped = options.fastMode
+    ? (candidatesAll.length - candidates.length) + (analyzedRestAll.length - analyzedRest.length)
+    : 0;
   // 위시리스트는 라이브러리와 중복 제거 (같은 appid는 라이브러리 쪽 위치에서 한 번만 fetch)
   const ownedIdSet = new Set(owned.map(g => g.appid));
   const wishlistIdsOnly = wishlist.map(w => w.appid).filter(id => !ownedIdSet.has(id));
   const uniqueIds = [
     ...seed.map(g => g.appid),
     ...candidates.map(g => g.appid),
-    ...remaining.map(g => g.appid),
+    ...analyzedRest.map(g => g.appid),
     ...wishlistIdsOnly,
   ];
   const total = uniqueIds.length;
+  if (cardFarmingSkipped > 0) {
+    logEvent("recommend_cardfarming_skipped", { steamId, count: cardFarmingSkipped });
+  }
+  if (fastModeSkipped > 0) {
+    logEvent("recommend_fastmode_capped", { steamId, count: fastModeSkipped });
+  }
+
+  // 분석 스코프. 빠른 모드에서는 조회 대상(seed+candidates+analyzedRest)으로 한정한다.
+  // 그렇지 않으면 상한 밖 analyzed 게임이 메타 없이 analyzeTaste에 들어가 'metaMissing'
+  // 으로 집계되어 프로필 통계에 "메타 누락 N"이 부풀려 표시된다(추천엔 무영향이나
+  // 사용자에게 오류처럼 보임). 스코프를 좁혀 통계가 실제 분석 표본을 반영하게 한다.
+  //   - 전체 모드: owned 그대로. 카드팜 게임은 조회 안 해도 playtime만으로 classify가
+  //     'card-farming'으로 집계(metaMissing 아님)하므로 통계 왜곡 없음.
+  //   - 라이브러리 크기(ownedGames)는 done/캐시에서 여전히 owned.length(전체)로 보고.
+  const fetchedOwnedIdSet = new Set(
+    [...seed, ...candidates, ...analyzedRest].map(g => g.appid),
+  );
+  const ownedForAnalysis = options.fastMode
+    ? owned.filter(g => fetchedOwnedIdSet.has(g.appid))
+    : owned;
 
   controller.enqueue(sseEvent("progress", { phase: "fetching-meta", loaded: 0, total }));
 
@@ -460,7 +520,7 @@ async function runAnalysis(
       if (loaded < t && now - lastPartialEmitAt >= PARTIAL_EMIT_INTERVAL_MS) {
         lastPartialEmitAt = now;
         const { profile, libraryUnplayed, wishlist: wishlistRecs } =
-          computeRecommendations(owned, wishlist, partial, tracks, options);
+          computeRecommendations(ownedForAnalysis, wishlist, partial, tracks, options);
         // 동일 signature dedup — 후반부 메타 누락 게임이 연속 fetch되어
         // 결과 모양이 같은 시점이 흔하다. 같은 sig가 또 오면 SSE/cache 양쪽
         // skip하여 (1) 네트워크 트래픽 (2) 클라이언트 React re-render
@@ -500,7 +560,7 @@ async function runAnalysis(
     options.maxRecommendationsPerTrack * REVIEW_SHORTLIST_MULTIPLIER,
     REVIEW_SHORTLIST_CAP,
   );
-  const shortlisted = computeRecommendations(owned, wishlist, detailsMap, tracks, options, shortlistSize);
+  const shortlisted = computeRecommendations(ownedForAnalysis, wishlist, detailsMap, tracks, options, shortlistSize);
   const profile = shortlisted.profile;
 
   if (isCancelled()) return;

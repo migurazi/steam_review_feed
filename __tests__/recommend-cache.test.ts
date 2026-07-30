@@ -92,6 +92,12 @@ describe("hashOptions", () => {
     expect(libOnly).not.toBe(wishOnly);
   });
 
+  it("fastMode 차이는 캐시 키를 분리한다 (빠른/전체 결과 미충돌)", () => {
+    const full = h({ ...DEFAULT_ANALYZE_OPTIONS, fastMode: false });
+    const fast = h({ ...DEFAULT_ANALYZE_OPTIONS, fastMode: true });
+    expect(full).not.toBe(fast);
+  });
+
   it("키 순서에 영향받지 않는다 (객체 spread 순서 무관)", () => {
     // 키 순서가 다른 객체 두 개를 만들 때 JS 엔진은 보통 키 순서를 보존하지만,
     // hashOptions가 sort 후 직렬화하므로 결과가 같아야 한다는 invariant 검증.
@@ -101,8 +107,10 @@ describe("hashOptions", () => {
       excludeFree: false,
       topNTaste: 6,
       maxRecommendationsPerTrack: 12,
+      fastMode: false,
     };
     const b: AnalyzeOptions = {
+      fastMode: false,
       maxRecommendationsPerTrack: 12,
       topNTaste: 6,
       excludeFree: false,

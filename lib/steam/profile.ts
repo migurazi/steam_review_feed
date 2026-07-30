@@ -65,6 +65,14 @@ export interface AnalyzeOptions {
   topNTaste: number;
   /** 추천 개수 상한 (트랙별 각각 적용). 1 ≤ N ≤ 30 */
   maxRecommendationsPerTrack: number;
+  /**
+   * 빠른 모드. true이면 라우트가 메타 조회 대상(analyzed-tier·미플레이 후보)에
+   * 상한을 두어 대형 라이브러리 첫 분석 시간을 크게 줄인다. 상한 밖 게임은 추천
+   * 후보에서 빠지고 성향도 상위 플레이 게임 중심으로 근사된다(완결성↔속도 트레이드오프).
+   * 캐시 키(hashOptions)에 자동 포함되어 빠른/전체 결과가 충돌하지 않는다.
+   * 순수 분석 함수는 이 값을 쓰지 않는다 — 조회 대상 축소는 전적으로 라우트 책임.
+   */
+  fastMode: boolean;
 }
 
 /**
@@ -79,6 +87,7 @@ export const DEFAULT_ANALYZE_OPTIONS: AnalyzeOptions = {
   excludeFree: false,
   topNTaste: 6,
   maxRecommendationsPerTrack: 12,
+  fastMode: false,
 };
 
 /**
