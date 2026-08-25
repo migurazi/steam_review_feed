@@ -7,6 +7,7 @@ import ReviewCard from '@/components/ReviewCard';
 import ProgressBar from '@/components/ProgressBar';
 import MediaPlayer from '@/components/MediaPlayer';
 import GamePrice from '@/components/GamePrice';
+import GameAchievementsSection from '@/components/GameAchievementsSection';
 import type { GameReviewsEvent, ProgressEvent as ProgressEventData, SteamReview, SteamMovie, SteamScreenshot, SteamPriceOverview } from '@/lib/steam/types';
 
 export default function GamePage({
@@ -145,6 +146,9 @@ export default function GamePage({
             />
           </div>
         )}
+
+        {/* 도전과제 요약 (Phase 2, §5.6.4) — 과제 없음/실패 시 자체적으로 렌더 안 함 */}
+        <GameAchievementsSection appId={appId} />
 
         {/* Filter panel (source hidden for single game view) */}
         <FilterPanel filters={filters} onChange={handleFilterChange} />

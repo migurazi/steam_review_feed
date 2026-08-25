@@ -60,3 +60,4 @@ next-env.d.ts
 
 # 측정 임시 스크립트 (작업 지시서 단계 0, 레포 커밋 금지)
 /scripts/measure-*
+/scripts/probe-*

@@ -12,8 +12,10 @@
 
 import fs from "fs";
 import path from "path";
+import { APP_ROOT } from "./app-root";
 
-const LOGS_DIR = path.join(process.cwd(), "logs");
+// standalone 서버의 cwd 변경(.next/standalone) 문제를 피해 프로젝트 루트에 고정.
+const LOGS_DIR = path.join(APP_ROOT, "logs");
 let logsDirEnsured = false;
 
 /** 로그 이벤트 타입 */
@@ -26,7 +28,8 @@ export type EventType =
   | "load_more"
   | "recommend_analyze"
   | "recommend_cardfarming_skipped"
-  | "recommend_fastmode_capped";
+  | "recommend_fastmode_capped"
+  | "achievement_scan";
 
 interface LogEntry {
   timestamp: string;

@@ -25,13 +25,34 @@
 - **`getAppDetailsBatch` 헬퍼** — `STREAM_CONCURRENCY` 단위 병렬 메타 일괄 조회 +
   `isCancelled` 즉시 반영 (라이브러리/위시리스트 합산 유니크 appid 처리)
 - **타입 확장** — `SteamGenre`, `SteamCategory` + `SteamAppDetails.genres/categories` 옵셔널 필드
-- **단위 테스트 +34** — `__tests__/profile.test.ts` (15 케이스 → 34 it), `steam-types`
-  +5 케이스. 94 → **128 테스트**.
+- **도전과제 대시보드** (`/achievements`) — 라이브러리 전체의 도전과제 달성 현황을
+  SSE로 스캔하여 완주율순으로 표시 (Phase 0–3)
+  - 게임을 펼치면 과제별 목록(아이콘 / 전역 희귀도 / 획득 시각) 표시, 상단
+    "모두 접기" 버튼으로 펼친 항목 일괄 접기
+  - 스캔 중단/재방문 시 지금까지 스캔한 결과를 유지(영속 진행률 upsert), 완료
+    후 게임 상세를 다녀와도 재스캔하지 않음
+  - **스키마 변경 알림** — 게임의 도전과제 스키마가 갱신되면(추가 / 삭제 /
+    완주 깨짐 / 숨김 해제) 알림 배너 노출, day 단위 dedup + 미확인(unseen) dedup
+  - Steam Web API: GetSchemaForGame / GetPlayerAchievements(`apiname` 키) /
+    GetGlobalAchievementPercentagesForApp
+  - 아웃바운드 전역 세마포어 + 일일 콜 예산(`lib/outbound-limit.ts`)으로 Rate Limit 회피
+  - LRU + SQLite 이중 캐시 (스키마/전역 달성률/개인 진행률/변경 이력/알림 테이블)
+- **게임 상세 도전과제 섹션** (`/game/[appId]`) — 진행률 바 + 희귀 과제 미리보기.
+  비로그인은 전역 희귀 과제, 프로필 '게임 세부 정보' 비공개 시 안내 문구
+- **셀프호스팅 셋업 마법사** — Steam API 키가 없는 최초 실행 시 브라우저 `/setup`
+  화면에서 키만 등록(수동 파일 편집 불필요), `.env.local`에 기록 후 즉시 반영
+  - `lib/app-root.ts` — standalone 서버가 `.next/standalone`으로 chdir 하는 문제를
+    피해 `INIT_CWD` 기반으로 프로젝트 루트를 찾아 DB/로그/`.env.local` 경로 고정
+- **단위 테스트** — 도전과제 diff/store/scan + app-root 등 커버리지 추가.
+  128 → **257 테스트** (22개 파일)
 
 ### Changed
 
 - `/feed` 헤더에 "성향 분석" 진입점 링크 추가
 - `EventType`에 `recommend_analyze` 추가 (`lib/logger.ts`)
+- 상단 네비게이션(`AppNav`)에 도전과제 탭 추가
+- DB/로그/`.env.local` 경로를 `lib/app-root.ts`의 `APP_ROOT` 기준으로 통일
+  (standalone 실행 시 데이터가 `.next/standalone` 하위로 흩어지던 문제 해소)
 
 ### Notes
 

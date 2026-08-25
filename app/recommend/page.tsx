@@ -20,6 +20,8 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import ThemeToggle from '@/components/ThemeToggle';
 import ProgressBar from '@/components/ProgressBar';
+import AppNav from '@/components/AppNav';
+import AppFooter from '@/components/AppFooter';
 import { DEFAULT_ANALYZE_OPTIONS, type AnalyzeOptions, type TasteProfile, type Recommendation, type ReviewBadge } from '@/lib/steam/profile';
 
 // UI default = lib default + 사용자 친화적 override.
@@ -257,20 +259,7 @@ function RecommendContent() {
           <Link href="/" className="text-[#1b6fa8] dark:text-[#66c0f4] font-bold text-base shrink-0">
             Steam Review Feed
           </Link>
-          <nav className="flex items-center gap-1 text-sm bg-gray-100 dark:bg-gray-800 rounded-lg p-1">
-            <Link
-              href="/feed"
-              className="px-3 py-1.5 rounded text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition-colors"
-            >
-              리뷰 피드
-            </Link>
-            <span
-              aria-current="page"
-              className="px-3 py-1.5 rounded bg-white dark:bg-[#1b2838] text-[#1b6fa8] dark:text-[#66c0f4] border border-gray-300 dark:border-[#4c6b8a] shadow-sm font-medium"
-            >
-              성향 분석
-            </span>
-          </nav>
+          <AppNav current="recommend" />
           <div className="flex items-center gap-3">
             {steamId && (
               <a
@@ -357,6 +346,7 @@ function RecommendContent() {
           />
         )}
       </main>
+      <AppFooter />
     </div>
   );
 }

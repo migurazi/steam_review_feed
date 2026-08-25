@@ -19,7 +19,7 @@ import FilterPanel, { FilterState } from '@/components/FilterPanel';
 import ReviewFeed from '@/components/ReviewFeed';
 import GameSearch from '@/components/GameSearch';
 import ThemeToggle from '@/components/ThemeToggle';
-import AboutDialog from '@/components/AboutDialog';
+import AppFooter from '@/components/AppFooter';
 import { parseFiltersFromParams, filtersToParams, saveFiltersToStorage, loadFiltersFromStorage } from '@/lib/filter-params';
 
 type DataSource = 'wishlist' | 'library' | 'both';
@@ -151,6 +151,13 @@ function FeedPageContent() {
             >
               성향 분석
             </Link>
+            <Link
+              href="/achievements"
+              className="hidden sm:inline text-sm text-gray-500 dark:text-gray-400 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] transition-colors"
+              title="라이브러리 도전과제 달성 현황"
+            >
+              도전과제
+            </Link>
             <div className="hidden sm:block w-48">
               <GameSearch />
             </div>
@@ -189,11 +196,11 @@ function FeedPageContent() {
         <ReviewFeed key={JSON.stringify(filters)} filters={filters} />
 
         {/* 하단 안내 */}
-        <div className="text-center pb-6 text-gray-400 dark:text-gray-500 text-xs space-y-1">
+        <div className="text-center pb-6 text-gray-400 dark:text-gray-500 text-xs">
           <p>최근 50개 게임의 리뷰를 표시합니다.</p>
-          <p>Steam Review Feed <AboutDialog /></p>
         </div>
       </main>
+      <AppFooter />
     </div>
   );
 }

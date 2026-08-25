@@ -32,6 +32,13 @@ export interface SteamOwnedGame {
   img_icon_url: string;
   /** 마지막 플레이 시각 (Unix timestamp) */
   rtime_last_played: number;
+  /**
+   * 커뮤니티 통계(도전과제/스탯) 노출 여부. 도전과제 스캔 대상 선정에 사용
+   * (작업 지시서 20260825_01 §5.3.1). GetOwnedGames가 이 필드를 항상 내려주는지는
+   * Phase 0 V7에서 검증 대상이므로 **옵셔널**로 둔다 — 부재 시 caller가 대체안으로
+   * 폴백한다(§5.3.1). true인 게임만 도전과제가 있을 개연성이 높다.
+   */
+  has_community_visible_stats?: boolean;
 }
 
 export interface SteamOwnedGamesResponse {
@@ -300,4 +307,99 @@ export interface DoneEvent {
 export interface ErrorEvent {
   appId: number;
   message: string;
+}
+
+// --- 도전과제 (ISteamUserStats) — 작업 지시서 20260825_01 ---
+//
+// 원형(raw) 응답 타입은 Steam이 내려주는 형태를 그대로 반영하고, 변환은 정규화
+// 함수에서만 수행한다 (§5.1.3, M17). 특히 percent/hidden/achieved 등 "숫자/불리언
+// 같지만 문자열·0/1로 오는" 필드를 타입 수준에서 원형 그대로 선언해, 경계에서만
+// parseFloat / Boolean 변환을 강제한다.
+
+/**
+ * GetSchemaForGame 응답의 과제 정의 원형.
+ * `game.availableGameStats.achievements[]` 의 원소.
+ *
+ * 주의:
+ *   - `hidden`은 boolean이 아니라 `0 | 1` (숨김 과제=1).
+ *   - `description`은 숨김 과제에서 누락될 수 있음 (V1 검증 대상, §5.1.3).
+ *   - `icon`/`icongray`는 URL 전체. 정규화 시 파일명만 남긴다 (§5.1.2).
+ */
+export interface SteamRawAchievementDef {
+  name: string;
+  displayName: string;
+  description?: string;
+  hidden: 0 | 1;
+  icon: string;
+  icongray: string;
+  defaultvalue: number;
+}
+
+/**
+ * GetSchemaForGame/v2 응답 전체.
+ * 과제 없는 앱은 `availableGameStats` 자체가 없거나 `achievements`가 빈 배열일 수
+ * 있다 — 셋 중 어느 형태인지는 V2 실측으로 확정한다 (§3.3, §5.1.1).
+ */
+export interface SteamAchievementSchemaResponse {
+  game?: {
+    gameName?: string;
+    availableGameStats?: {
+      achievements?: SteamRawAchievementDef[];
+    };
+  };
+}
+
+/**
+ * GetPlayerAchievements/v1 응답 전체.
+ *
+ * 주의:
+ *   - 성공 시 `playerstats.success === true`.
+ *   - 원소 키가 스키마의 `name`이 아니라 **`apiname`**이라는 가정은 V4 검증 대상
+ *     (§5.1.4). 정규화 계층에서 `apiname → name`으로 통일한다.
+ *   - `achieved`는 `0 | 1`, `unlocktime`은 미획득 시 `0`.
+ *   - 실패 시 `success === false` + `error` 문자열. private 프로필과 통계 없는
+ *     게임의 error 문자열 구별 가능성은 V5/V6 검증 대상 (§5.1.4, R7).
+ */
+export interface SteamPlayerAchievementsResponse {
+  playerstats?: {
+    success?: boolean;
+    error?: string;
+    achievements?: {
+      apiname: string;
+      achieved: 0 | 1;
+      unlocktime: number;
+    }[];
+  };
+}
+
+/**
+ * GetGlobalAchievementPercentagesForApp/v0002 응답 전체.
+ *
+ * **`percent`는 number가 아니라 string이다** (§3.1 실측 확인). 저장 전
+ * parseFloat 하고, Number.isFinite 실패 시 해당 항목을 제외한다 (§5.1.7).
+ * `name`은 스키마의 `name`(API명)과 동일한 안정 키.
+ */
+export interface SteamGlobalPercentagesResponse {
+  achievementpercentages?: {
+    achievements?: { name: string; percent: string }[];
+  };
+}
+
+/**
+ * 스키마에서 diff/표시에 실제로 쓰는 필드만 남긴 정규화 형태 (§5.1.2).
+ *
+ * `icon`은 URL 전체가 아니라 파일명만 저장한다. CDN 도메인이 바뀌어도 diff가
+ * 오탐되지 않고 용량도 준다. 표시 시
+ *   https://media.steampowered.com/steamcommunity/public/images/apps/{appId}/{icon}
+ * 규칙으로 복원한다 (V1에서 규칙 미확인 시 URL 전체 저장으로 되돌림).
+ */
+export interface AchievementDef {
+  /** API명 — 유일한 안정 키. displayName 이 아니다. */
+  name: string;
+  displayName: string;
+  description: string;
+  /** 원본은 0|1 이므로 boolean 변환 */
+  hidden: boolean;
+  /** 아이콘 파일명 (URL 전체가 아님). 예: "a1b2c3....jpg" */
+  icon: string;
 }

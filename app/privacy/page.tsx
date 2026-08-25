@@ -35,6 +35,10 @@ export default function PrivacyPage() {
                   <td className="py-2 text-green-600 dark:text-green-400">수집함 (세션 쿠키)</td>
                 </tr>
                 <tr>
+                  <td className="py-2 pr-4">도전과제 달성 현황 및 획득 시각</td>
+                  <td className="py-2 text-green-600 dark:text-green-400">수집함</td>
+                </tr>
+                <tr>
                   <td className="py-2 pr-4">Steam 비밀번호</td>
                   <td className="py-2 text-gray-400 dark:text-gray-500">수집하지 않음</td>
                 </tr>

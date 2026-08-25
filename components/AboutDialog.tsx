@@ -66,7 +66,8 @@ export default function AboutDialog() {
 
             {/* Description */}
             <p className="text-sm text-gray-600 dark:text-gray-300">
-              Steam 위시리스트와 라이브러리 게임들의 최신 리뷰를 한 피드에서 모아보는 서비스.
+              Steam 위시리스트·라이브러리 게임의 최신 리뷰를 한 피드에서 모아보고,
+              성향 기반 게임 추천과 도전과제 달성 현황까지 확인하는 서비스.
             </p>
 
             {/* Tech Stack */}

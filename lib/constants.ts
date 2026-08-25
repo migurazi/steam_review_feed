@@ -37,13 +37,48 @@ export const RATE_LIMIT_MAX_REQUESTS = 30;
  * 변경 후(concurrency 1 + 1500ms): 40 req/min — Steam 한도 내. 5347 게임 첫
  * 분석은 ~134분으로 길지만, app_details_cache에 successfull 저장 → 다음
  * 분석부터 캐시 hit으로 빠름. 한 번만 견디면 됨.
+ *
+ * 주의: 위 근거 서술(40 req/min 한도 등)은 **`appDetails` 키에만** 적용된다 (L3).
+ *   `reviews`/`achievements`는 공식 엔드포인트라 한도 체계가 다르다 —
+ *   `achievements`는 공식 api.steampowered.com(키당 100,000/day)이며
+ *   appdetails 레인과 경쟁하지 않는다 (작업 지시서 20260825_01 §1.2).
  */
 export const STEAM_API_DELAY = {
   /** store.steampowered.com/api/appdetails (비공식, Rate Limit 엄격) */
   appDetails: 1500,
   /** store.steampowered.com/appreviews (공식 문서화) */
   reviews: 500,
+  /**
+   * 공식 api.steampowered.com/ISteamUserStats 용 (도전과제 스키마/진행률/전역률).
+   * appdetails(비공식, 1500ms)와 **별개 레인**. V9 부하 측정 결과에 따라 500으로
+   * 상향될 수 있다 (§3.3 V9, §5.3.3).
+   */
+  achievements: 250,
 } as const;
+
+/**
+ * 도전과제 스캔의 앱 단위 동시성 (한 사용자 스캔 내에서 병렬 처리할 앱 수).
+ * 작업 지시서 20260825_01 §5.3.3. `achievements` 딜레이와 함께 실효 req/s를 결정.
+ */
+export const ACHIEVEMENT_CONCURRENCY = 3;
+
+/**
+ * 프로세스 전역 아웃바운드 동시성 상한 (전 사용자 합산).
+ *
+ * 인바운드 IP 제한(`lib/rate-limit.ts`)은 아웃바운드 동시성을 제어하지 못한다.
+ * 사용자 N명이 동시에 첫 스캔을 돌리면 N × ACHIEVEMENT_CONCURRENCY 동시 요청이
+ * 나가므로, `lib/outbound-limit.ts`의 전역 세마포어가 이 값으로 상한을 건다 (M11).
+ */
+export const ACHIEVEMENT_GLOBAL_CONCURRENCY = 8;
+
+/**
+ * 도전과제 일일 콜 예산 (프로세스 내 카운터 상한).
+ *
+ * Steam Web API Key 한도 100,000/day에 대한 안전 마진. 초과 시 새 스캔을 거부하고
+ * `done.budgetExceeded`를 반환한다 (§5.8, §7.1). 프로세스 재시작 시 리셋되므로
+ * 단일 프로세스 배포(standalone) 가정 하의 soft guard다.
+ */
+export const ACHIEVEMENT_DAILY_CALL_BUDGET = 80_000;
 
 /**
  * 동시에 병렬 처리할 게임 수 (SSE 스트리밍에서 사용).

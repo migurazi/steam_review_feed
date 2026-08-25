@@ -56,29 +56,22 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/2] .env.local 확인
-if exist .env.local (
-    echo       .env.local 이미 존재합니다. 건너뜁니다.
-) else (
-    echo       .env.local 생성 중 (SESSION_SECRET 자동 생성)
-    powershell -NoProfile -Command "$secret = [Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)); Set-Content -Path .env.local -Value @('STEAM_API_KEY=여기에_Steam_API_키_입력', ('SESSION_SECRET=' + $secret), 'NEXT_PUBLIC_BASE_URL=http://localhost:3000') -Encoding UTF8"
-    if errorlevel 1 (
-        echo.
-        echo [ERROR] .env.local 생성 실패
-        pause
-        exit /b 1
-    )
-    echo       .env.local 생성 완료
+echo [2/2] 환경설정 준비 (.env.local + SESSION_SECRET 자동 생성)
+call node scripts\setup-env.mjs
+if errorlevel 1 (
     echo.
-    echo       *** STEAM_API_KEY를 직접 입력해야 합니다 ***
-    echo       발급: https://steamcommunity.com/dev/apikey
+    echo [ERROR] 환경설정 생성 실패
+    pause
+    exit /b 1
 )
+echo       Steam API 키는 나중에 브라우저에서 등록합니다 (파일 직접 편집 불필요).
 
 echo.
 echo ============================================
 echo  Setup 완료!
-echo  - 개발 서버 실행:    dev.bat
-echo  - 프로덕션 빌드:     build.bat
-echo  - 프로덕션 실행:     start.bat
+echo  다음 단계: build.bat 실행 -^> start.bat 실행
+echo  서버가 뜨고 브라우저가 열리면, 화면 안내에 따라
+echo  Steam API 키를 한 번만 등록하면 됩니다.
+echo  (키 발급: https://steamcommunity.com/dev/apikey)
 echo ============================================
 pause

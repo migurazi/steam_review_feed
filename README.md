@@ -14,6 +14,8 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 
 - **통합 리뷰 피드** — 위시리스트·라이브러리 게임의 최신 리뷰를 한 화면에서 확인
 - **성향 분석 + 보유 게임 추천** (`/recommend`) — 라이브러리 플레이타임에서 장르·카테고리 신호를 추출하여 두 트랙(라이브러리 미플레이 / 위시리스트)으로 추천. **코사인 유사도**로 취향을 매칭해 태그가 많은 게임의 편향을 제거하고, **리뷰 호평률을 랭킹에 블렌딩**(0.65·취향 + 0.35·호평)하여 "취향 + 평 좋은 게임" 순으로 정렬하고 각 추천 카드에 호평률 배지 표시. 카드 농사용 단기 플레이는 사용자 조정 가능한 임계값으로 제외
+- **도전과제 대시보드** (`/achievements`) — 라이브러리 전체의 도전과제 달성 현황을 한 화면에 집계. SSE로 점진 스캔하며 진행률·요약(총 획득/완벽 달성/평균 달성률/최근 30일)을 실시간 표시하고, **남은 개수 순**(적은/많은) 등 다양한 정렬과 "완벽 달성 숨김" 필터를 제공. 게임 행을 펼치면 **과제별 전역 희귀도·획득 일시**를 보여주고(숨김 과제 스포일러 보호), **스키마 변경·완벽 달성 해제**를 감지해 알림 배너로 통지. 진행률은 영속되어 중단해도 재방문 시 이어서 스캔
+- **셀프호스팅 셋업 마법사** — 소스를 받아 각자 PC에서 실행할 때, `.env` 편집 없이 브라우저 `/setup` 화면에서 Steam API 키만 등록하면 됨 (SESSION_SECRET은 자동 생성). 배치 파일(`setup/build/start.bat`) 더블클릭으로 설치·빌드·실행
 - **Steam 로그인** — Steam OpenID 로그인 또는 Steam ID 직접 입력
 - **SSE 점진적 로딩** — 게임별 리뷰가 병렬로 수집되어 실시간 스트리밍
 - **다양한 필터** — 언어, 기간, 플레이타임, 글자수, 추천/비추천, 무료 게임 제외
@@ -33,32 +35,40 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 | 캐시 | lru-cache (인메모리) + SQLite 영속 캐시 (게임 메타·추천 결과) |
 | 인증 | Steam OpenID |
 | 동영상 | hls.js (HLS 스트리밍) |
-| 테스트 | Vitest (128개 테스트) |
+| 테스트 | Vitest (257개 테스트) |
 | 배포 | Docker + GitLab CI/CD |
 
 ## 프로젝트 구조
 
 ```
 ├── app/
-│   ├── api/           # API 라우트 (auth, cache, reviews, search, wishlist, library, media, recommend)
+│   ├── api/           # API 라우트 (auth, cache, reviews, search, wishlist, library, media, recommend, achievements, setup)
 │   ├── feed/          # 통합 리뷰 피드 페이지
 │   ├── recommend/     # 성향 분석 + 추천 페이지
-│   ├── game/[appId]/  # 게임별 리뷰 페이지
+│   ├── achievements/  # 도전과제 대시보드 페이지
+│   ├── setup/         # 최초 설정 마법사 (Steam API 키 등록)
+│   ├── game/[appId]/  # 게임별 리뷰 페이지 (+ 도전과제 요약 섹션)
 │   ├── privacy/       # 개인정보 처리방침
 │   ├── layout.tsx     # 루트 레이아웃 (ThemeProvider, FOUC 방지)
 │   └── page.tsx       # 홈 (로그인/검색)
-├── components/        # React 컴포넌트 (ThemeProvider, MediaPlayer, ReviewCard 등)
+├── components/        # React 컴포넌트 (ThemeProvider, MediaPlayer, ReviewCard, AppNav, AchievementRow 등)
 ├── lib/
-│   ├── constants.ts   # 전역 상수 (PAGE_SIZE, RATE_LIMIT 등)
+│   ├── constants.ts   # 전역 상수 (PAGE_SIZE, RATE_LIMIT, 도전과제 동시성/예산 등)
+│   ├── app-root.ts    # 앱 데이터 루트 경로 (standalone cwd 문제 대응)
 │   ├── env.ts         # 환경변수 검증
 │   ├── init.ts        # 서버 초기화 (env 검증 + DB 스케줄러)
 │   ├── cache.ts       # 인메모리 TTL + LRU 캐시
 │   ├── db.ts          # SQLite DB 초기화 및 쿼리
 │   ├── logger.ts      # JSONL 이벤트 로깅
 │   ├── rate-limit.ts  # 사용자당 Rate Limit
+│   ├── outbound-limit.ts   # 아웃바운드 전역 세마포어 + 일일 콜 예산 (도전과제 스캔)
+│   ├── achievement-diff.ts # 도전과제 스키마 diff + 스냅샷 가드
+│   ├── achievement-store.ts # 도전과제 영속 계층 (스키마/진행률/알림)
+│   ├── achievement-scan.ts # 도전과제 스캔 오케스트레이션
 │   ├── session.ts     # iron-session 세션 관리
 │   └── steam/         # Steam API 클라이언트, 타입, 정렬, 필터, 성향 분석(profile)
-├── __tests__/         # 단위 테스트 (13파일 128개)
+├── scripts/setup-env.mjs   # 최초 실행 .env.local 부트스트랩 (SESSION_SECRET 자동 생성)
+├── __tests__/         # 단위 테스트 (22파일 257개)
 ├── middleware.ts       # 인증 미들웨어 (Edge Runtime)
 ├── Dockerfile
 ├── docker-compose.yml
@@ -75,34 +85,39 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
   - winget 직접 사용: `winget install OpenJS.NodeJS.LTS`
 - Steam Web API Key ([여기서 발급받기](https://steamcommunity.com/dev/apikey))
 
-### 1. 환경 변수 설정
+### 빠른 시작 (Windows, 비개발자 권장)
 
-프로젝트 루트에 `.env.local` 파일을 생성합니다:
+**파일 편집 없이** 배치 파일 더블클릭 + 브라우저에서 키 한 번 등록으로 끝납니다.
 
-```env
-STEAM_API_KEY=발급받은_API_키
-SESSION_SECRET=32자_이상_랜덤_문자열
-NEXT_PUBLIC_BASE_URL=http://localhost:3000
-```
-
-> `STEAM_API_KEY`와 `SESSION_SECRET`은 필수입니다. 설정하지 않으면 서버 시작 시 경고가 표시됩니다.
-
-### 2. 설치 및 실행
-
-#### 윈도우일 때 실행하는 법 (Batch 파일, 권장)
-
-프로젝트 루트의 `.bat` 파일을 **더블클릭**만 하면 됩니다. 각 스크립트는 선행 조건(`node_modules`, `.env.local`, standalone 빌드)을 자동 검사합니다.
+1. **Node.js 설치** — `setup.bat` 더블클릭 (없으면 winget으로 자동 설치 제안). 이미 있으면 그대로 진행.
+2. `setup.bat` → `build.bat` → `start.bat` 순서로 더블클릭.
+   - `setup.bat`: `npm install` + `.env.local` 자동 생성 (**SESSION_SECRET 자동 발급**).
+   - `build.bat`: 프로덕션 빌드.
+   - `start.bat`: 서버 실행 + **브라우저 자동 오픈**.
+3. 브라우저에 뜨는 **설정 화면(`/setup`)**에서 [Steam API 키](https://steamcommunity.com/dev/apikey)를 붙여넣고 "저장하고 시작하기". 끝.
+   - 키는 이 컴퓨터의 `.env.local`에만 저장되며, 저장 즉시 반영됩니다(재시작 불필요).
+   - 키를 바꾸려면 `.env.local`의 `STEAM_API_KEY`를 직접 편집하세요.
 
 | 파일 | 동작 |
 |------|------|
-| `setup.bat` | `npm install` + `.env.local` 자동 생성 (SESSION_SECRET 32바이트 랜덤 발급) |
+| `setup.bat` | Node 확인/설치 + `npm install` + `.env.local` 생성(SESSION_SECRET 자동) |
 | `dev.bat` | 개발 서버 (`npm run dev`) |
 | `build.bat` | 프로덕션 빌드 (`npm run build`) |
-| `start.bat` | standalone 서버 실행 (`npm run start:standalone`) |
+| `start.bat` | standalone 서버 실행 + 브라우저 자동 오픈 |
 
-처음 받았다면 `setup.bat` 실행 후 생성된 `.env.local`의 `STEAM_API_KEY`만 직접 입력하면 바로 사용 가능합니다.
+### 환경 변수 (수동 설정, 고급)
 
-#### 수동 실행 (npm)
+배치 파일 대신 직접 설정하려면 프로젝트 루트에 `.env.local`을 만듭니다:
+
+```env
+STEAM_API_KEY=발급받은_API_키   # 비워 두면 첫 실행 시 /setup 화면에서 입력받음
+SESSION_SECRET=32자_이상_랜덤_문자열   # setup.bat/start.bat이 자동 생성
+NEXT_PUBLIC_BASE_URL=http://localhost:3000
+```
+
+> `SESSION_SECRET`은 `node scripts/setup-env.mjs`가 자동 생성합니다. `STEAM_API_KEY`는 비워 두면 서버 첫 접속 시 `/setup` 페이지로 안내됩니다.
+
+### 수동 실행 (npm)
 
 ```bash
 # 의존성 설치

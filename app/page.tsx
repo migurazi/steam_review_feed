@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import SteamLoginButton from '@/components/SteamLoginButton';
 import GameSearch from '@/components/GameSearch';
 import ThemeToggle from '@/components/ThemeToggle';
-import AboutDialog from '@/components/AboutDialog';
+import AppFooter from '@/components/AppFooter';
 
 export default function Home() {
   const [manualOpen, setManualOpen] = useState(false);
@@ -16,24 +16,35 @@ export default function Home() {
   const [authChecked, setAuthChecked] = useState(false);
   const router = useRouter();
 
-  // 이미 로그인된 사용자가 헤더 로고 등으로 /에 도착하면 /feed로 자동 이동.
-  // 비로그인 시에는 그대로 hero/login UI 표시.
+  // 최초 설정(Steam API 키) 확인 → 미설정이면 /setup으로 보낸다. 설정돼 있으면
+  // 로그인 상태를 확인해, 이미 로그인이면 /feed로, 아니면 hero/login UI를 표시한다.
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/auth/me')
-      .then((res) => res.json())
-      .then((data: { steamId: string | null }) => {
+    (async () => {
+      try {
+        const setup = await (await fetch('/api/setup')).json();
         if (cancelled) return;
-        if (data.steamId) {
-          router.replace('/feed');
-        } else {
-          setAuthChecked(true);
+        if (!setup.configured) {
+          router.replace('/setup');
+          return;
         }
-      })
-      .catch(() => {
+      } catch {
+        // 설정 상태 확인 실패는 치명적이지 않다 — 로그인 화면으로 계속 진행.
+      }
+      try {
+        const data: { steamId: string | null } = await (
+          await fetch('/api/auth/me')
+        ).json();
+        if (cancelled) return;
+        if (data.steamId) router.replace('/feed');
+        else setAuthChecked(true);
+      } catch {
         if (!cancelled) setAuthChecked(true);
-      });
-    return () => { cancelled = true; };
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [router]);
 
   async function handleManualSubmit(e: React.FormEvent) {
@@ -172,13 +183,7 @@ export default function Home() {
         </div>
       </main>
 
-      {/* Footer */}
-      <footer className="border-t border-gray-200 dark:border-gray-800 px-4 py-4 text-center text-gray-500 dark:text-gray-600 text-xs">
-        Steam Review Feed <AboutDialog /> — Steam과 무관한 비공식 서비스입니다.{' '}
-        <a href="/privacy" className="hover:text-gray-700 dark:hover:text-gray-400 transition-colors underline">
-          개인정보 처리방침
-        </a>
-      </footer>
+      <AppFooter />
     </div>
   );
 }

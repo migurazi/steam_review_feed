@@ -14,6 +14,8 @@ A service that aggregates the latest reviews from your Steam Wishlist and Librar
 
 - **Unified Review Feed** — View the latest reviews from Wishlist & Library games in one place
 - **Taste Analysis + Recommendations** (`/recommend`) — Extracts genre/category signals from your library playtime and recommends games in two tracks (library-unplayed / wishlist). Card-farming short plays are filtered by a user-adjustable threshold
+- **Achievements Dashboard** (`/achievements`) — Scans your whole library's achievement progress via SSE, sorted by completion. Expand a game for its per-achievement list (icon / global rarity / unlock time), a collapse-all control, and change alerts when a game's achievement schema is updated (added / removed / perfect-broken)
+- **Self-Hosting Setup Wizard** — On first launch with no Steam API key, register it through the `/setup` screen in the browser (saved to `.env.local`) — no manual file editing
 - **Steam Login** — Steam OpenID authentication or direct Steam ID input
 - **SSE Progressive Loading** — Reviews collected in parallel and streamed in real-time
 - **Rich Filters** — Language, date range, playtime, review length, positive/negative, exclude free games
@@ -33,32 +35,40 @@ A service that aggregates the latest reviews from your Steam Wishlist and Librar
 | Cache | lru-cache (in-memory) |
 | Auth | Steam OpenID |
 | Video | hls.js (HLS streaming) |
-| Testing | Vitest (128 tests) |
+| Testing | Vitest (257 tests) |
 | Deployment | Docker + GitLab CI/CD |
 
 ## Project Structure
 
 ```
 ├── app/
-│   ├── api/           # API routes (auth, cache, reviews, search, wishlist, library, media, recommend)
+│   ├── api/           # API routes (auth, cache, reviews, search, wishlist, library, media, recommend, achievements, setup)
 │   ├── feed/          # Unified review feed page
 │   ├── recommend/     # Taste analysis + recommendations page
-│   ├── game/[appId]/  # Per-game review page
+│   ├── achievements/  # Achievements dashboard page
+│   ├── setup/         # First-run setup wizard (register Steam API key)
+│   ├── game/[appId]/  # Per-game review page (+ achievements summary section)
 │   ├── privacy/       # Privacy policy
 │   ├── layout.tsx     # Root layout (ThemeProvider, FOUC prevention)
 │   └── page.tsx       # Home (login/search)
-├── components/        # React components (ThemeProvider, MediaPlayer, ReviewCard, etc.)
+├── components/        # React components (ThemeProvider, MediaPlayer, ReviewCard, AppNav, AchievementRow, etc.)
 ├── lib/
-│   ├── constants.ts   # Shared constants (PAGE_SIZE, RATE_LIMIT, etc.)
+│   ├── constants.ts   # Shared constants (PAGE_SIZE, RATE_LIMIT, achievement concurrency/budget, etc.)
+│   ├── app-root.ts    # App data root path (works around standalone cwd)
 │   ├── env.ts         # Environment variable validation
 │   ├── init.ts        # Server initialization (env validation + DB scheduler)
 │   ├── cache.ts       # In-memory TTL + LRU cache
 │   ├── db.ts          # SQLite DB initialization and queries
 │   ├── logger.ts      # JSONL event logging
 │   ├── rate-limit.ts  # Per-user rate limiting
+│   ├── outbound-limit.ts   # Global outbound semaphore + daily call budget (achievement scan)
+│   ├── achievement-diff.ts # Achievement schema diff + snapshot guard
+│   ├── achievement-store.ts # Achievement persistence layer (schema/progress/alerts)
+│   ├── achievement-scan.ts # Achievement scan orchestration
 │   ├── session.ts     # iron-session management
 │   └── steam/         # Steam API client, types, sorting, filters, taste profile
-├── __tests__/         # Unit tests (13 files, 128 tests)
+├── scripts/setup-env.mjs   # First-run .env.local bootstrap (auto-generates SESSION_SECRET)
+├── __tests__/         # Unit tests (22 files, 257 tests)
 ├── middleware.ts       # Auth middleware (Edge Runtime)
 ├── Dockerfile
 ├── docker-compose.yml
@@ -75,32 +85,37 @@ A service that aggregates the latest reviews from your Steam Wishlist and Librar
   - Direct winget install: `winget install OpenJS.NodeJS.LTS`
 - Steam Web API Key ([Get one here](https://steamcommunity.com/dev/apikey))
 
-### 1. Environment Variables
+### Quick Start (Windows, recommended for non-developers)
 
-Create a `.env.local` file in the project root:
+**No file editing** — double-click the batch files, then register your key once in the browser.
 
-```env
-STEAM_API_KEY=your_api_key
-SESSION_SECRET=random_string_at_least_32_chars
-NEXT_PUBLIC_BASE_URL=http://localhost:3000
-```
-
-> `STEAM_API_KEY` and `SESSION_SECRET` are required. A warning will be displayed on server start if missing.
-
-### 2. Install & Run
-
-#### On Windows — Batch files (recommended)
-
-Just **double-click** the `.bat` files in the project root. Each script auto-checks prerequisites (`node_modules`, `.env.local`, standalone build).
+1. **Install Node.js** — double-click `setup.bat` (offers winget auto-install if missing). Skip if already installed.
+2. Double-click `setup.bat` → `build.bat` → `start.bat` in order.
+   - `setup.bat`: `npm install` + creates `.env.local` (**SESSION_SECRET auto-generated**).
+   - `build.bat`: production build.
+   - `start.bat`: runs the server and **opens the browser automatically**.
+3. On the **setup screen (`/setup`)** that appears, paste your [Steam API key](https://steamcommunity.com/dev/apikey) and click "Save & Start". Done.
+   - The key is stored only in this machine's `.env.local` and takes effect immediately (no restart).
+   - To change it later, edit `STEAM_API_KEY` in `.env.local` directly.
 
 | File | Action |
 |------|--------|
-| `setup.bat` | `npm install` + auto-generates `.env.local` (32-byte random SESSION_SECRET) |
+| `setup.bat` | Check/install Node + `npm install` + create `.env.local` (SESSION_SECRET auto) |
 | `dev.bat` | Dev server (`npm run dev`) |
 | `build.bat` | Production build (`npm run build`) |
-| `start.bat` | Standalone server (`npm run start:standalone`) |
+| `start.bat` | Standalone server + auto-open browser |
 
-On first run, execute `setup.bat`, then fill in `STEAM_API_KEY` in the generated `.env.local` — that's it.
+### Environment Variables (manual, advanced)
+
+To configure without the batch files, create `.env.local` in the project root:
+
+```env
+STEAM_API_KEY=your_api_key   # leave empty to be prompted at /setup on first run
+SESSION_SECRET=random_string_at_least_32_chars   # auto-generated by setup.bat/start.bat
+NEXT_PUBLIC_BASE_URL=http://localhost:3000
+```
+
+> `SESSION_SECRET` is auto-generated by `node scripts/setup-env.mjs`. If `STEAM_API_KEY` is empty, the first visit redirects to the `/setup` page.
 
 #### Manual (npm)
 

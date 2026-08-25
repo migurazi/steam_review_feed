@@ -20,6 +20,8 @@ import { getSteamApiKey } from "@/lib/env";
 import { STEAM_API_DELAY, STREAM_CONCURRENCY } from "@/lib/constants";
 import { setAppMeta, setAppMetaBatch } from "@/lib/app-meta-cache";
 import { getAppDetailsFromStore, setAppDetailsInStore } from "@/lib/app-details-store";
+import { computeSchemaHash } from "@/lib/achievement-diff";
+import { getGlobalFromStore, setGlobalInStore } from "@/lib/achievement-store";
 import type {
   SteamWishlistItem,
   SteamWishlistResponse,
@@ -34,6 +36,11 @@ import type {
   SteamVanityUrlResponse,
   SteamStoreSearchItem,
   SteamStoreSearchResponse,
+  AchievementDef,
+  SteamRawAchievementDef,
+  SteamAchievementSchemaResponse,
+  SteamPlayerAchievementsResponse,
+  SteamGlobalPercentagesResponse,
 } from "./types";
 
 const STEAM_API_BASE = "https://api.steampowered.com";
@@ -617,4 +624,255 @@ export async function getPlayerSummary(
   }>(url);
 
   return res?.response?.players?.[0] ?? null;
+}
+
+// ============================================================================
+// 도전과제 (ISteamUserStats) — 작업 지시서 20260825_01 §5.1
+// ============================================================================
+
+/**
+ * fetchJson과 달리 **non-2xx 응답의 body도 파싱해 반환**한다.
+ *
+ * `GetPlayerAchievements`는 프로필 비공개 시 HTTP 403, 통계 없는 게임 시 HTTP 400을
+ * 내면서 body의 `playerstats.error`로 사유를 구분한다(§3.5 실측). fetchJson은 모든
+ * non-2xx를 null로 버려 이 구분이 불가능하므로, 이 헬퍼로 status+body를 함께 얻는다.
+ * 로그 마스킹(maskUrl)은 동일하게 유지해 키 노출을 막는다.
+ */
+async function fetchJsonWithStatus<T>(
+  url: string
+): Promise<{ status: number; data: T | null }> {
+  try {
+    const res = await fetch(url);
+    const contentType = res.headers.get("content-type") || "";
+    let data: T | null = null;
+    if (contentType.includes("application/json")) {
+      try {
+        data = (await res.json()) as T;
+      } catch {
+        data = null;
+      }
+    }
+    if (!res.ok) {
+      logThrottled(
+        `status:${res.status}`,
+        "warn",
+        `[steam-api] HTTP ${res.status} for ${maskUrl(url)}`
+      );
+    }
+    return { status: res.status, data };
+  } catch (err) {
+    logThrottled(
+      "fetch-failure",
+      "error",
+      `[steam-api] Fetch failed for ${maskUrl(url)}: ${err instanceof Error ? err.message : String(err)}`
+    );
+    return { status: 0, data: null };
+  }
+}
+
+/** icon URL에서 파일명만 추출한다. 이미 파일명이면 그대로. (§5.1.2, V1 실측) */
+function extractIconFilename(iconUrl: string): string {
+  if (!iconUrl) return "";
+  const i = iconUrl.lastIndexOf("/");
+  return i >= 0 ? iconUrl.slice(i + 1) : iconUrl;
+}
+
+/**
+ * 원형 스키마 과제 배열을 정규화한다 (순수 함수 — 단위 테스트 대상).
+ *   - hidden: 0|1 → boolean
+ *   - description: 누락(undefined) → "" (숨김 과제는 description이 없을 수 있음, V1)
+ *   - icon: URL 전체 → 파일명 (§5.1.2)
+ */
+export function normalizeAchievementDefs(
+  raw: SteamRawAchievementDef[]
+): AchievementDef[] {
+  return raw.map((r) => ({
+    name: r.name,
+    displayName: r.displayName,
+    description: r.description ?? "",
+    hidden: r.hidden === 1,
+    icon: extractIconFilename(r.icon),
+  }));
+}
+
+/** 스키마 조회 결과 3분기 (§5.1.1). error와 none을 반드시 구분한다(C2). */
+export type SchemaResult =
+  | { status: "ok"; defs: AchievementDef[]; hash: string }
+  | { status: "none" }
+  | { status: "error" };
+
+/**
+ * 앱 스키마를 조회한다 (§5.1.1). **캐싱/스토어 저장은 caller(scan)가 담당**하며
+ * 이 함수는 순수 fetch + 분류만 한다.
+ *
+ * - fetchJson이 null(429/403/5xx/네트워크/content-type 불일치) → `error`
+ *   (V3 실측: 존재하지 않는 appid는 HTTP 400 → null → error)
+ * - 200 + achievements 배열 비어있지 않음 → `ok`
+ * - 200 + availableGameStats 부재/빈 achievements → `none` (V2 실측)
+ */
+export async function getAchievementSchema(appId: number): Promise<SchemaResult> {
+  const url =
+    `${STEAM_API_BASE}/ISteamUserStats/GetSchemaForGame/v2/` +
+    `?key=${getSteamApiKey()}&appid=${appId}&l=english`;
+  // fetchJson 대신 fetchJsonWithStatus를 써서 상태 코드를 구분한다:
+  //   - 400/404: 존재하지 않거나 삭제/이관된 appid → 'none'(negative 캐시 대상).
+  //     이렇게 해야 삭제된 게임이 매 스캔 재시도되지 않는다(§5.1.1, 코드리뷰 #5).
+  //   - 0(네트워크)/429/403/5xx/비JSON: 일시 실패 → 'error'(재시도).
+  const { status, data } =
+    await fetchJsonWithStatus<SteamAchievementSchemaResponse>(url);
+  if (status === 400 || status === 404) return { status: "none" };
+  if (status !== 200 || !data) return { status: "error" };
+
+  const achs = data.game?.availableGameStats?.achievements;
+  if (Array.isArray(achs) && achs.length > 0) {
+    const defs = normalizeAchievementDefs(achs);
+    return { status: "ok", defs, hash: computeSchemaHash(defs) };
+  }
+  return { status: "none" };
+}
+
+/** 개인 진행률 조회 결과 4상태 (§5.1.4). */
+export type PlayerResult =
+  | {
+      status: "ok";
+      achievements: { name: string; achieved: boolean; unlockTime: number }[];
+    }
+  | { status: "private" }
+  | { status: "unavailable" }
+  | { status: "error" };
+
+/**
+ * GetPlayerAchievements 실패 응답을 private/unavailable/error로 분류한다
+ * (순수 함수 — 단위 테스트 대상, R7 핵심).
+ *
+ * §3.5 실측: private = HTTP 403 "Profile is not public",
+ *            unavailable = HTTP 400 "Requested app has no stats".
+ * 문자열을 1차 근거로, HTTP 코드를 2차 근거로 쓴다. 둘 다 애매하면 `error`(재시도).
+ */
+export function classifyPlayerStatsError(
+  httpStatus: number,
+  body: SteamPlayerAchievementsResponse | null
+): "private" | "unavailable" | "error" {
+  const err = body?.playerstats?.error ?? "";
+  if (/not public/i.test(err)) return "private";
+  if (/no stats/i.test(err)) return "unavailable";
+  if (httpStatus === 403) return "private";
+  if (httpStatus === 400) return "unavailable";
+  return "error";
+}
+
+/**
+ * 본인 개인 진행률을 조회한다 (§5.1.4). `l` 파라미터를 붙이지 않는다(문구는 스키마
+ * 에서 가져오므로 페이로드만 커진다). 원소 키는 `apiname`이며 정규화에서 `name`으로
+ * 통일한다(§3.5 V4 확정).
+ */
+export async function getPlayerAchievements(
+  steamId: string,
+  appId: number
+): Promise<PlayerResult> {
+  const url =
+    `${STEAM_API_BASE}/ISteamUserStats/GetPlayerAchievements/v1/` +
+    `?key=${getSteamApiKey()}&steamid=${steamId}&appid=${appId}`;
+  const { status, data } = await fetchJsonWithStatus<SteamPlayerAchievementsResponse>(url);
+  if (status === 0) return { status: "error" }; // 네트워크 실패 — 재시도 대상
+
+  const ps = data?.playerstats;
+  if (ps?.success && Array.isArray(ps.achievements)) {
+    return {
+      status: "ok",
+      achievements: ps.achievements.map((a) => ({
+        name: a.apiname, // apiname → name (§3.5 V4)
+        achieved: a.achieved === 1,
+        unlockTime: a.unlocktime,
+      })),
+    };
+  }
+  return { status: classifyPlayerStatsError(status, data) };
+}
+
+/**
+ * 전역 달성률(희귀도)을 조회한다 (Phase 2, §5.1.7). **API Key 불필요**(§3.1 실측).
+ *
+ * 반환: { [apiName]: percent(0~100 number) }. `percent`는 원본이 string이라
+ * parseFloat하고 Number.isFinite 실패 항목은 제외한다. LRU(1일) → app_achievement_global
+ * hydrate → API 순. 조회 실패/과제 없음이면 빈 객체.
+ */
+export async function getGlobalAchievementPercentages(
+  appId: number
+): Promise<Record<string, number>> {
+  const cacheKey = `ach:global:${appId}`;
+  const cached = cacheGet<Record<string, number>>(cacheKey);
+  if (cached && !cached.isStale) return cached.data;
+
+  // 영속 store hydrate (LRU가 재시작으로 비워졌을 때).
+  try {
+    const stored = getGlobalFromStore(appId);
+    if (stored && Date.now() - stored.fetchedAt < CACHE_TTL.achievementGlobal) {
+      cacheSet(cacheKey, stored.percentages, CACHE_TTL.achievementGlobal);
+      return stored.percentages;
+    }
+  } catch (err) {
+    console.warn(`[steam-api] app_achievement_global read failed for ${appId}:`, err);
+  }
+
+  // getSteamApiKey()를 호출하지 않는다 — 키 불필요(§5.1.7).
+  const url =
+    `${STEAM_API_BASE}/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/` +
+    `?gameid=${appId}`;
+  const res = await fetchJson<SteamGlobalPercentagesResponse>(url);
+
+  const list = res?.achievementpercentages?.achievements;
+  const out: Record<string, number> = {};
+  if (Array.isArray(list)) {
+    for (const a of list) {
+      const pct = parseFloat(a.percent);
+      if (Number.isFinite(pct)) out[a.name] = pct;
+    }
+  }
+  cacheSet(cacheKey, out, CACHE_TTL.achievementGlobal);
+  try {
+    setGlobalInStore(appId, out);
+  } catch (err) {
+    console.warn(`[steam-api] app_achievement_global write failed for ${appId}:`, err);
+  }
+  return out;
+}
+
+/**
+ * 표시용 스키마를 로케일별로 조회한다 (Phase 2, §5.1.6). diff/hash용 en 스키마와
+ * 달리 이건 **표시 전용**이라 LRU만 쓰고 영속 저장하지 않는다.
+ *
+ * @param lang 'ko'(koreana) | 'en'(english). 앱이 전면 한국어라 기본은 ko.
+ * @returns 정규화된 AchievementDef[] (표시 문구가 해당 로케일). 과제 없음/조회 실패면 null.
+ */
+export async function getAchievementSchemaForDisplay(
+  appId: number,
+  lang: "ko" | "en"
+): Promise<AchievementDef[] | null> {
+  const l = lang === "ko" ? "koreana" : "english";
+  const cacheKey = `ach:schema:${lang}:${appId}`;
+  const cached = cacheGet<AchievementDef[] | null>(cacheKey);
+  if (cached && !cached.isStale) return cached.data;
+
+  const url =
+    `${STEAM_API_BASE}/ISteamUserStats/GetSchemaForGame/v2/` +
+    `?key=${getSteamApiKey()}&appid=${appId}&l=${l}`;
+  const { status, data } =
+    await fetchJsonWithStatus<SteamAchievementSchemaResponse>(url);
+
+  // 400/404(삭제/이관) = 과제 없음으로 negative 캐시. 그 외 실패는 캐시하지 않음(재시도).
+  if (status === 400 || status === 404) {
+    cacheSet(cacheKey, null, CACHE_TTL.achievementSchemaMissing);
+    return null;
+  }
+  if (status !== 200 || !data) return null;
+
+  const achs = data.game?.availableGameStats?.achievements;
+  if (Array.isArray(achs) && achs.length > 0) {
+    const defs = normalizeAchievementDefs(achs);
+    cacheSet(cacheKey, defs, CACHE_TTL.achievementSchema);
+    return defs;
+  }
+  cacheSet(cacheKey, null, CACHE_TTL.achievementSchemaMissing);
+  return null;
 }
