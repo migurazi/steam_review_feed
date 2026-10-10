@@ -29,6 +29,8 @@ export type EventType =
   | "recommend_analyze"
   | "recommend_cardfarming_skipped"
   | "recommend_fastmode_capped"
+  | "recommend_price_fetch_failed"
+  | "recommend_store_deals"
   | "achievement_scan";
 
 interface LogEntry {

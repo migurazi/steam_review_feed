@@ -5,9 +5,10 @@
  * 캐시 미스 시 API 호출 -> 캐시 저장. Rate Limit 딜레이 적용.
  *
  * API 분류 (기획서 7.1절):
- * - 공식 API (api.steampowered.com): IWishlistService, IPlayerService, ISteamUser
+ * - 공식 API (api.steampowered.com): IWishlistService, IPlayerService, ISteamUser,
+ *   IStoreBrowseService/GetItems (키 불필요, 발굴 트랙)
  * - 공식 문서화 (store.steampowered.com): appreviews
- * - 비공식 (store.steampowered.com): appdetails, storesearch
+ * - 비공식 (store.steampowered.com): appdetails, storesearch, search/results, featuredcategories
  *
  * 에러 처리:
  *   fetchJson은 모든 HTTP 오류를 null로 반환한다.
@@ -15,11 +16,19 @@
  *   네트워크 오류, Content-Type 불일치, JSON 파싱 실패도 null 반환.
  */
 
-import { cacheGet, cacheSet, CACHE_TTL } from "@/lib/cache";
+import { cacheGet, cacheSet, CACHE_TTL, lastKnownPriceGet, lastKnownPriceSet } from "@/lib/cache";
 import { getSteamApiKey } from "@/lib/env";
-import { STEAM_API_DELAY, STREAM_CONCURRENCY } from "@/lib/constants";
+import {
+  STEAM_API_DELAY,
+  STREAM_CONCURRENCY,
+  PRICE_BATCH_SIZE,
+  PRICE_LAST_KNOWN_TTL_MS,
+  DISCOVER_SEARCH_PAGE_SIZE,
+  STORE_ITEMS_BATCH_SIZE,
+} from "@/lib/constants";
+import { parseSearchResultAppIds, normalizeStoreItem } from "./deals";
 import { setAppMeta, setAppMetaBatch } from "@/lib/app-meta-cache";
-import { getAppDetailsFromStore, setAppDetailsInStore } from "@/lib/app-details-store";
+import { getAppDetailsFromStore, setAppDetailsInStore, getFreshAppIdsInStore } from "@/lib/app-details-store";
 import { computeSchemaHash } from "@/lib/achievement-diff";
 import { getGlobalFromStore, setGlobalInStore } from "@/lib/achievement-store";
 import type {
@@ -30,6 +39,12 @@ import type {
   SteamAppDetails,
   SteamAppDetailsResponse,
   SteamPriceOverview,
+  SteamPriceBatchResponse,
+  PriceSnapshot,
+  SteamSearchResultsResponse,
+  SteamFeaturedCategoriesResponse,
+  SteamStoreBrowseResponse,
+  StoreItemSummary,
   SteamReview,
   SteamReviewsResponse,
   ReviewSummary,
@@ -184,6 +199,30 @@ export function resetAppDetailsBackoff(): void {
   appDetailsBackoffMs = 0;
 }
 
+/**
+ * 현재 공유 store backoff 값(ms). 0이면 최근 429가 없다.
+ * 테스트와 /recommend의 가격 재시도 판단(최근 429 중이면 재시도 생략)에서 쓴다.
+ */
+export function getAppDetailsBackoffMs(): number {
+  return appDetailsBackoffMs;
+}
+
+/**
+ * 공유 backoff 대상 URL인지 판정한다.
+ *
+ * store.steampowered.com의 비공식 엔드포인트(appdetails, 가격 배치, 검색, featured 등)는
+ * 같은 IP-level Rate Limit을 공유하므로 어느 쪽의 429든 backoff를 올려야 한다.
+ * appreviews는 공식 문서화 엔드포인트로 한도 체계가 달라 제외한다.
+ * (작업 지시서 20261010_01 §1-1, Momus M7)
+ */
+export function isStoreRateLimited(url: string): boolean {
+  // storesearch는 사용자 타이핑마다 딜레이 없이 호출되므로 제외한다 — 포함하면 검색
+  // 입력의 429가 /recommend의 backoff를 30초까지 끌어올린다.
+  return url.startsWith(`${STEAM_STORE_BASE}/`)
+    && !url.includes("/appreviews/")
+    && !url.includes("/api/storesearch");
+}
+
 // --- 공통 fetch 헬퍼 ---
 
 /**
@@ -200,10 +239,10 @@ async function fetchJson<T>(url: string): Promise<T | null> {
   try {
     const res = await fetch(url);
 
-    // appdetails 호출에 한해 적응형 backoff 갱신 — Steam의 IP-level rate limit
-    // 변동(시간대·평판)에 자동 적응. URL 기반 dispatch (fetchJson을 share하는
-    // 다른 endpoint에는 영향 없게).
-    const isAppDetails = url.includes("/api/appdetails");
+    // store 비공식 엔드포인트에 한해 적응형 backoff 갱신 — Steam의 IP-level rate
+    // limit 변동(시간대·평판)에 자동 적응. URL 기반 dispatch (공식 API·appreviews
+    // 에는 영향 없게). 판정 기준은 isStoreRateLimited 참조.
+    const isAppDetails = isStoreRateLimited(url);
 
     if (!res.ok) {
       const masked = maskUrl(url);
@@ -370,12 +409,9 @@ export async function getAppDetails(
   if (!appData?.success || !appData.data) return null;
 
   cacheSet(cacheKey, appData.data, CACHE_TTL.appInfo);
-  // 가격은 별도 캐시로 짧은 TTL 분리 저장 (없으면 null로 저장하여 재호출 방지)
-  cacheSet(
-    `app:${appId}:price:KR`,
-    appData.data.price_overview ?? null,
-    CACHE_TTL.appPrice
-  );
+  // 가격은 별도 캐시로 짧은 TTL 분리 저장 (없으면 null로 저장하여 재호출 방지).
+  // last-known(24h)도 함께 기록해 가격 조회 장애 시 fallback이 되게 한다 (20261010_02 §1-1).
+  writePriceCache(appId, appData.data.price_overview ?? null, CACHE_TTL.appPrice, Date.now());
   // 영속 메타 캐시 — 재시작·Rate Limit 시 fallback 용도.
   // DB I/O 실패가 API 흐름을 막지 않도록 try/catch.
   try {
@@ -396,25 +432,405 @@ export async function getAppDetails(
   return { data: appData.data, isStale: false };
 }
 
-/**
- * 가격 정보만 빠르게 조회한다.
- * 가격 캐시(`app:{appId}:price`, 1시간 TTL)를 우선 확인하고,
- * 미스 시 getAppDetails를 호출해 캐시를 채운다.
- *
- * 무료 게임 또는 가격 정보 없는 게임은 null 반환.
- *
- * @param appId Steam App ID
- * @returns 가격 정보. 없으면 null.
- */
-export async function getAppPrice(
-  appId: number
-): Promise<SteamPriceOverview | null> {
-  const cached = cacheGet<SteamPriceOverview | null>(`app:${appId}:price:KR`);
-  if (cached) return cached.data;
+/** 가격 캐시 키 (신선도 판단용, TTL appPrice=1h). getAppDetails 신규 조회와 가격 배치가 공유한다. */
+function priceCacheKey(appId: number): string {
+  return `app:${appId}:price:KR`;
+}
 
-  // 캐시 미스: getAppDetails가 두 캐시를 모두 채운다
-  const details = await getAppDetails(appId);
-  return details?.data.price_overview ?? null;
+/**
+ * 가격을 신선도 키(메인 LRU, appPrice TTL)와 last-known(전용 LRU, 24h)에 함께 기록한다.
+ * 가격을 받는 모든 경로가 이 헬퍼를 쓴다. 작업 지시서 20261010_02 §1-1.
+ *
+ * last-known을 따로 두는 이유: lru-cache(allowStale)는 만료 항목을 처음 get할 때 돌려주면서
+ * 삭제한다. 그래서 가격 키의 stale 값은 정확히 한 번만 fallback으로 쓸 수 있었고, Steam 일시 장애가
+ * 두 번 이어지면 가격이 사라졌다. last-known은 24시간 동안 여러 번 읽어도 남는다. 원래 fetchedAt을
+ * 담아 클라이언트가 묵은 가격을 회색·"N시간 전 가격"으로 구분하게 한다. 메인 LRU를 압박하지 않도록
+ * lib/cache.ts의 전용 인스턴스에 둔다 (/code-review 2차 R2).
+ */
+function writePriceCache(appId: number, price: SteamPriceOverview | null, ttl: number, fetchedAt: number): void {
+  cacheSet(priceCacheKey(appId), price, ttl);
+  lastKnownPriceSet<SteamPriceOverview | null>(appId, { price, fetchedAt });
+}
+
+/** last-known 가격 (24시간 이내에 마지막으로 확인한 가격). 없으면 null. */
+function readLastKnownPrice(appId: number): PriceSnapshot | null {
+  return lastKnownPriceGet<SteamPriceOverview | null>(appId);
+}
+
+/**
+ * 같은 appid의 대화형 가격 재조회 진행 중 Promise (20261010_02 §2-1).
+ * 만료 직후 여러 탭·사용자가 같은 게임을 열어도 store 호출은 한 번만 나가고 모두 그 결과를 공유한다.
+ */
+const priceRefreshInFlight = new Map<number, Promise<PriceSnapshot | undefined>>();
+
+/**
+ * 단건 가격 재조회 (dedupe). 대화형 경로라 base delay(1.5s)를 생략하고 공유 backoff만 따른다 —
+ * 사용자 클릭당 1회 호출이라 배치처럼 연속 호출하지 않기 때문 (§2-2).
+ * @returns 받은 스냅샷. 조회 실패면 undefined.
+ */
+function refreshPriceDeduped(appId: number): Promise<PriceSnapshot | undefined> {
+  const running = priceRefreshInFlight.get(appId);
+  if (running) return running;
+  const p = getAppPricesBatch([appId], undefined, undefined, { skipBaseDelay: true })
+    .then(m => m.get(appId))
+    .catch(err => {
+      console.warn(`[steam-api] price refresh failed for ${appId}:`, err);
+      return undefined;
+    })
+    .finally(() => priceRefreshInFlight.delete(appId));
+  priceRefreshInFlight.set(appId, p);
+  return p;
+}
+
+/**
+ * 가격 스냅샷을 조회한다 (게임 상세 화면용). 작업 지시서 20261010_02 §1-3, §2.
+ *
+ *   1) 가격 키가 fresh            → 그대로 (fetchedAt = 캐시 기록 시각).
+ *   2) last-known(24h)이 있음     → 즉시 반환 + 백그라운드 재조회(dedupe).
+ *   3) 최근 429로 backoff 중      → 기다리지 않는다. info LRU의 price_overview(최대 7일 묵음)가 있으면
+ *                                   그 시각과 함께 즉시 반환 + 백그라운드 재조회.
+ *   4) 그 외                       → 재조회를 기다린다(base delay 없음, dedupe).
+ *
+ * 묵은 값은 항상 원래 fetchedAt과 함께 반환한다 — 라우트가 priceFetchedAt으로 내려 화면이 회색 표시.
+ * (단계 1의 이전 구현은 stale 첫 읽기 후 항목이 삭제되어, 백그라운드 재조회가 실패하면 다음 요청이
+ * 완전 미스로 1.5s+backoff를 기다린 뒤 null을 반환했다.)
+ *
+ * @returns 스냅샷. price=null은 무료/미판매. 아무 정보도 얻지 못하면 null.
+ */
+export async function getAppPriceSnapshot(appId: number): Promise<PriceSnapshot | null> {
+  const cached = cacheGet<SteamPriceOverview | null>(priceCacheKey(appId));
+  if (cached && !cached.isStale) return { price: cached.data, fetchedAt: cached.fetchedAt };
+
+  const lastKnown = readLastKnownPrice(appId)
+    ?? (cached ? { price: cached.data, fetchedAt: cached.fetchedAt } : null); // 배포 직후(last-known 없음) 대비
+  if (lastKnown) {
+    void refreshPriceDeduped(appId);
+    return { ...lastKnown, fallback: true };
+  }
+
+  if (appDetailsBackoffMs > 0) {
+    // info LRU 가격도 24시간 상한을 지킨다 — info는 7일 캐시라 그대로 쓰면 끝난 할인이 보일 수 있다.
+    // (신규 조회 시 last-known도 함께 기록되므로, 실제로 이 경로가 쓰이는 것은 LRU가 last-known만
+    // 밀어낸 경우 정도다.) 상한을 넘으면 기다리지 않고 미상으로 두고 백그라운드 재조회만 건다.
+    const info = cacheGet<SteamAppDetails>(`app:${appId}:info:KR`);
+    void refreshPriceDeduped(appId);
+    if (info?.data.price_overview && Date.now() - info.fetchedAt <= PRICE_STALE_FALLBACK_MAX_AGE_MS) {
+      return { price: info.data.price_overview, fetchedAt: info.fetchedAt, fallback: true };
+    }
+    return null;
+  }
+
+  return (await refreshPriceDeduped(appId)) ?? null;
+}
+
+/** 테스트용. 진행 중 재조회 맵을 비운다. */
+export function resetPriceRefreshInFlight(): void {
+  priceRefreshInFlight.clear();
+}
+
+/**
+ * 가격 배치 응답의 한 항목을 정규화한다.
+ * price_overview가 있으면 그 값, success=true인데 가격이 없거나(`data: []`) success=false면 null.
+ */
+function normalizePriceEntry(
+  entry: SteamPriceBatchResponse[string] | undefined
+): { price: SteamPriceOverview | null; ttl: number } | undefined {
+  // 응답에 appid 자체가 없음 → 미상(캐시 안 함).
+  if (!entry) return undefined;
+  // success=false: cc=KR에서 삭제·지역제한 앱은 매번 같은 답이라 "미상"으로 두면 매 분석마다
+  // 재조회되고 가격 커버리지를 영구히 깎는다. 반대로 일시 이상일 수도 있으므로 판매 불가(null)
+  // 로 보되 짧은 TTL로만 캐시한다.
+  if (!entry.success) return { price: null, ttl: PRICE_UNAVAILABLE_TTL_MS };
+  const data = entry.data;
+  if (data && !Array.isArray(data) && data.price_overview) {
+    return { price: data.price_overview, ttl: CACHE_TTL.appPrice };
+  }
+  return { price: null, ttl: CACHE_TTL.appPrice };
+}
+
+/** success=false(판매 불가) 가격 캐시 TTL. 일시 이상일 가능성을 고려해 짧게. */
+const PRICE_UNAVAILABLE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * 재조회 실패 시 가격 키의 stale 값을 fallback으로 쓸 수 있는 최대 나이 (last-known이 없을 때의
+ * 보조 경로 — 배포 직후 last-known이 아직 없는 항목용). last-known TTL과 같은 24시간.
+ * 이보다 오래된 가격은 끝난 할인을 "할인 중"으로 보여줄 위험이 커서 미상으로 둔다.
+ */
+const PRICE_STALE_FALLBACK_MAX_AGE_MS = PRICE_LAST_KNOWN_TTL_MS;
+
+/**
+ * 여러 앱의 가격을 한 번에 조회한다 (작업 지시서 20261010_01 §1-1).
+ *
+ * - 가격 캐시가 fresh인 appid는 호출 없이 결과에 포함한다. stale은 미스로 취급.
+ * - 미스분은 appdetails `filters=price_overview` 다중 appid로 PRICE_BATCH_SIZE씩 조회.
+ *   배치마다 appDetails 딜레이 + 공유 backoff (같은 store 호스트 Rate Limit).
+ * - fetch 실패한 배치의 appid는 캐시에 쓰지 않는다. 실패를 null로 캐시하면 1시간 동안
+ *   "무료/미판매"로 오표시되기 때문. 대신 last-known(24h, 20261010_02 §1-2) → 가격 키의 stale
+ *   값(24h 이내) 순으로 원래 fetchedAt과 함께 채운다(클라이언트가 회색 표시). 둘 다 없으면 미상(누락).
+ *   last-known은 만료 전까지 삭제되지 않으므로 연속 실패에도 매번 채워진다.
+ * - 영속 저장하지 않는다(가격은 짧은 수명).
+ *
+ * @param opts.skipBaseDelay 대화형 단건 조회용. base delay(1.5s)를 생략하고 공유 backoff만 따른다.
+ * @returns appid → PriceSnapshot. 없는 appid는 가격 미상.
+ */
+export async function getAppPricesBatch(
+  appIds: number[],
+  onProgress?: (loaded: number, total: number) => void,
+  isCancelled: () => boolean = () => false,
+  opts: { skipBaseDelay?: boolean } = {}
+): Promise<Map<number, PriceSnapshot>> {
+  const result = new Map<number, PriceSnapshot>();
+  const uniqueIds = Array.from(new Set(appIds));
+  const total = uniqueIds.length;
+  let loaded = 0;
+  const misses: number[] = [];
+  // 가격 키의 stale 항목은 lru-cache가 첫 get에서 삭제하므로 여기서 보관해 두고, 재조회에 실패했고
+  // last-known도 없는 appid에만 보조 fallback으로 쓴다.
+  const staleById = new Map<number, PriceSnapshot>();
+
+  for (const id of uniqueIds) {
+    const cached = cacheGet<SteamPriceOverview | null>(priceCacheKey(id));
+    if (cached && !cached.isStale) {
+      result.set(id, { price: cached.data, fetchedAt: cached.fetchedAt });
+      loaded++;
+    } else {
+      if (cached) staleById.set(id, { price: cached.data, fetchedAt: cached.fetchedAt });
+      misses.push(id);
+    }
+  }
+  if (loaded > 0) onProgress?.(loaded, total);
+
+  for (let i = 0; i < misses.length; i += PRICE_BATCH_SIZE) {
+    if (isCancelled()) return result;
+    const batch = misses.slice(i, i + PRICE_BATCH_SIZE);
+
+    if (!opts.skipBaseDelay) await delay(STEAM_API_DELAY.appDetails);
+    await appDetailsBackoffDelay();
+    if (isCancelled()) return result;
+
+    const url =
+      `${STEAM_STORE_BASE}/api/appdetails?appids=${batch.join(",")}` +
+      `&filters=price_overview&cc=KR`;
+    const res = await fetchJson<SteamPriceBatchResponse>(url);
+    const fetchedAt = Date.now();
+
+    if (res) {
+      for (const id of batch) {
+        const normalized = normalizePriceEntry(res[String(id)]);
+        if (normalized === undefined) continue;
+        writePriceCache(id, normalized.price, normalized.ttl, fetchedAt);
+        result.set(id, { price: normalized.price, fetchedAt });
+      }
+    }
+    loaded += batch.length;
+    onProgress?.(loaded, total);
+  }
+  // 조회하지 못한 미스분 fallback: last-known → 가격 키 stale(24h 이내). 취소로 중단된 경우에도
+  // 위 루프의 return 전까지 도달하지 않으므로, 이 fallback은 끝까지 진행한 조회에만 적용된다.
+  const now = Date.now();
+  for (const id of misses) {
+    if (result.has(id)) continue;
+    const lastKnown = readLastKnownPrice(id);
+    if (lastKnown) {
+      result.set(id, { ...lastKnown, fallback: true });
+      continue;
+    }
+    const stale = staleById.get(id);
+    if (stale && now - stale.fetchedAt <= PRICE_STALE_FALLBACK_MAX_AGE_MS) result.set(id, { ...stale, fallback: true });
+  }
+  return result;
+}
+
+// --- 스토어 할인 발굴 (작업 지시서 20261010_01 단계 2) ---
+
+const STORE_SPECIALS_CACHE_KEY = "store:specials:KR";
+
+/** GetItems 요약 캐시 키. 가격을 담으므로 KR 고정 컨텍스트를 키에 명시한다. */
+function storeItemCacheKey(appId: number): string {
+  return `storeitem:${appId}:KR`;
+}
+
+/**
+ * 지금 할인 중인 게임 appid 후보를 모은다 (발굴 트랙 후보 수집, §2-2).
+ *
+ * 소스 (단계 0 V3·V4, 부록 B 설계 확정 3):
+ *   (a) 검색 specials — `specials=1&sort_by=Reviews_DESC&category1=998`(게임만, 리뷰순),
+ *       DISCOVER_SEARCH_PAGE_SIZE(100)씩 maxItems까지 페이지 순회. results_html에서
+ *       parseSearchResultAppIds로 appid만 추출(패키지·번들·다중 앱 행 제외).
+ *   (b) (a)의 첫 페이지가 실패하면 featuredcategories specials(약 10개)로 fallback.
+ *
+ * 호출 규칙: 페이지마다 appDetails 딜레이 + 공유 store backoff (같은 store 호스트 한도).
+ * 페이지 사이와 딜레이 직후에 shouldStop을 확인한다 — 발굴 시간 예산·탭 닫기 대응.
+ *
+ * 캐시: `store:specials:KR` (1시간, 사용자 무관 공유). (a)로 끝까지 모았을 때만 저장한다.
+ *   - 실패·(b) fallback 결과는 저장하지 않는다 — 다음 분석에서 (a)를 다시 시도하도록.
+ *   - shouldStop으로 중간에 끊긴 결과도 저장하지 않는다(불완전한 목록을 1시간 굳히지 않게).
+ *   - 2페이지 이후 실패는 이미 모은 결과로 진행하되 저장하지 않는다.
+ *
+ * 파서 이상 감지: success 페이지인데 아직 결과가 남았으면서(start < total_count) 행을 하나도
+ *   못 뽑으면 검색 HTML 구조 변경·일시적 빈 응답으로 본다(로그). 첫 페이지면 fallback, 후속
+ *   페이지면 모은 만큼 degraded로 진행한다. 그렇지 않으면 짧거나 빈 목록이 "정상 완료"로 1시간
+ *   캐시되어 모든 사용자에게 잘린 결과·"할인 게임 없음"이 보인다. 빈 목록은 어떤 경우에도 캐시하지 않는다.
+ *
+ * @returns ids = 후보 appid(순서 = 리뷰순). degraded = 계획한 소스를 끝까지 확인하지 못함
+ *   (featured fallback, 후속 페이지 실패, shouldStop 중단) — 라우트가 "일부 후보만 확인"으로 알린다.
+ *   두 소스 모두 실패하면 null.
+ */
+export async function getStoreSpecials(
+  maxItems: number,
+  shouldStop: () => boolean = () => false
+): Promise<{ ids: number[]; degraded: boolean } | null> {
+  const cached = cacheGet<number[]>(STORE_SPECIALS_CACHE_KEY);
+  if (cached && !cached.isStale) return { ids: cached.data.slice(0, maxItems), degraded: false };
+
+  const ids: number[] = [];
+  const seen = new Set<number>();
+  let complete = false;
+  let firstPageFailed = false;
+
+  for (let start = 0; ids.length < maxItems; start += DISCOVER_SEARCH_PAGE_SIZE) {
+    if (shouldStop()) break;
+    await delay(STEAM_API_DELAY.appDetails);
+    await appDetailsBackoffDelay();
+    if (shouldStop()) break;
+
+    const url =
+      `${STEAM_STORE_BASE}/search/results/?specials=1&infinite=1&json=1&cc=KR&l=koreana` +
+      `&sort_by=Reviews_DESC&category1=998&start=${start}&count=${DISCOVER_SEARCH_PAGE_SIZE}`;
+    const res = await fetchJson<SteamSearchResultsResponse>(url);
+    if (!res || res.success !== 1 || typeof res.results_html !== "string") {
+      if (start === 0) firstPageFailed = true;
+      break;
+    }
+    const pageIds = parseSearchResultAppIds(res.results_html);
+    // total_count가 숫자가 아니면(누락·문자열) "끝"을 판단할 근거가 없다. 0으로 보면 첫 페이지가
+    // 곧 끝으로 판정되어 잘린 목록이 "정상 완료"로 1시간 캐시된다 (/code-review 2차 R6).
+    // 모를 때는 maxItems를 채운 경우만 complete로 인정하고, 빈 페이지는 이상으로 본다.
+    const totalKnown = typeof res.total_count === "number" && Number.isFinite(res.total_count);
+    const totalCount = totalKnown ? res.total_count : Number.POSITIVE_INFINITY;
+    // 아직 결과가 남았다는(start < total_count) 페이지에서 행을 하나도 못 뽑으면 끝이 아니라 이상이다
+    // (마크업 변경·일시적 빈 응답). 끝으로 보면 짧은 목록이 "정상 완료"로 1시간 캐시된다.
+    //   - 첫 페이지: fallback 경로로 (firstPageFailed).
+    //   - 후속 페이지: 모은 만큼으로 진행하되 complete가 아니므로 degraded·미캐시.
+    if (pageIds.length === 0 && start < totalCount) {
+      logThrottled(
+        "store-specials-parse",
+        "warn",
+        `[steam-api] search specials: start=${start} total_count=${res.total_count} but 0 rows parsed — markup changed?`
+      );
+      if (start === 0) firstPageFailed = true;
+      break;
+    }
+    for (const id of pageIds) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    // 결과 끝: 이 페이지가 total_count를 덮었거나, total_count 이후라 행이 없는 경우(위 분기 제외분).
+    const reachedEnd = pageIds.length === 0 || start + DISCOVER_SEARCH_PAGE_SIZE >= totalCount;
+    if (reachedEnd || ids.length >= maxItems) {
+      complete = true;
+      break;
+    }
+  }
+
+  if (complete) {
+    const out = ids.slice(0, maxItems);
+    if (out.length > 0) cacheSet(STORE_SPECIALS_CACHE_KEY, out, CACHE_TTL.storeDeals);
+    return { ids: out, degraded: false };
+  }
+  // 중간 중단/후속 페이지 실패 — 모은 만큼, degraded.
+  if (!firstPageFailed) return { ids: ids.slice(0, maxItems), degraded: true };
+
+  // (b) fallback — 첫 페이지 실패 시에만.
+  if (shouldStop()) return { ids: [], degraded: true };
+  await delay(STEAM_API_DELAY.appDetails);
+  await appDetailsBackoffDelay();
+  if (shouldStop()) return { ids: [], degraded: true };
+  const featured = await fetchJson<SteamFeaturedCategoriesResponse>(
+    `${STEAM_STORE_BASE}/api/featuredcategories?cc=KR&l=koreana`
+  );
+  const items = featured?.specials?.items;
+  if (!Array.isArray(items)) return null;
+  // type 0 = 앱(게임/소프트웨어). 할인 중인 항목만. 패키지·번들은 type이 다르다.
+  const fallbackIds = Array.from(new Set(
+    items
+      .filter(it => it.type === 0 && typeof it.id === "number" && (it.discount_percent ?? 0) > 0)
+      .map(it => it.id)
+  ));
+  // fallback은 약 10개뿐이라 항상 degraded ("일부 후보만 확인").
+  return { ids: fallbackIds.slice(0, maxItems), degraded: true };
+}
+
+/**
+ * 여러 앱의 스토어 요약(가격·리뷰 요약·카테고리)을 GetItems로 한 번에 조회한다.
+ * IStoreBrowseService/GetItems/v1 (공식 API 호스트, 키 불필요 — 단계 0 V2).
+ *
+ * 발굴 트랙의 pool 가격 재확인과 리뷰 하한·점수를 한 번에 처리하기 위해 쓴다
+ * (부록 B 설계 확정 4). per-후보 appreviews 호출(0.5s × N)과 가격 배치가 필요 없어진다.
+ *
+ * - fresh 캐시(`storeitem:{id}:KR`, 1시간)는 호출 없이 포함. stale은 미스로 취급
+ *   (가격을 담으므로 getAppPricesBatch와 같은 규칙).
+ * - 미스분을 STORE_ITEMS_BATCH_SIZE(100)씩 조회, 호출 사이 reviews 딜레이(500ms).
+ *   api.steampowered.com 호스트라 store backoff 대상이 아니다.
+ * - 조회 실패한 배치, success!==1 항목은 결과에서 누락(=미상)하고 캐시하지 않는다.
+ * - context는 KR 고정 — storeItemToPrice가 통화를 KRW로 기록하는 전제.
+ *
+ * @returns appid → StoreItemSummary. 없는 appid는 미상.
+ */
+export async function getStoreItemsBatch(
+  appIds: number[],
+  onProgress?: (loaded: number, total: number) => void,
+  shouldStop: () => boolean = () => false
+): Promise<Map<number, StoreItemSummary>> {
+  const result = new Map<number, StoreItemSummary>();
+  const uniqueIds = Array.from(new Set(appIds));
+  const total = uniqueIds.length;
+  let loaded = 0;
+  const misses: number[] = [];
+
+  for (const id of uniqueIds) {
+    const cached = cacheGet<StoreItemSummary>(storeItemCacheKey(id));
+    if (cached && !cached.isStale) {
+      result.set(id, cached.data);
+      loaded++;
+    } else {
+      misses.push(id);
+    }
+  }
+  if (loaded > 0) onProgress?.(loaded, total);
+
+  for (let i = 0; i < misses.length; i += STORE_ITEMS_BATCH_SIZE) {
+    if (shouldStop()) return result;
+    const batch = misses.slice(i, i + STORE_ITEMS_BATCH_SIZE);
+    await delay(STEAM_API_DELAY.reviews);
+    if (shouldStop()) return result;
+
+    const input = {
+      ids: batch.map(appid => ({ appid })),
+      context: { language: "koreana", country_code: "KR" },
+      data_request: { include_reviews: true },
+    };
+    const url =
+      `${STEAM_API_BASE}/IStoreBrowseService/GetItems/v1/` +
+      `?input_json=${encodeURIComponent(JSON.stringify(input))}`;
+    const res = await fetchJson<SteamStoreBrowseResponse>(url);
+    const fetchedAt = Date.now();
+    const items = res?.response?.store_items;
+    if (Array.isArray(items)) {
+      const requested = new Set(batch);
+      for (const raw of items) {
+        const summary = normalizeStoreItem(raw, fetchedAt);
+        // 요청하지 않은 appid가 섞여 와도(리다이렉트 등) 결과·캐시에 넣지 않는다.
+        if (!summary || !requested.has(summary.appid)) continue;
+        cacheSet(storeItemCacheKey(summary.appid), summary, CACHE_TTL.storeDeals);
+        result.set(summary.appid, summary);
+      }
+    }
+    loaded += batch.length;
+    onProgress?.(loaded, total);
+  }
+  return result;
 }
 
 /**
@@ -464,6 +880,17 @@ export async function getReviews(
   const reviews = res.reviews;
   cacheSet(cacheKey, reviews, CACHE_TTL.reviews);
   return { data: reviews, isStale: false };
+}
+
+/**
+ * 캐시에 있는 리뷰 요약만 들여다본다 (네트워크·딜레이 없음).
+ * /recommend의 위시 주기 재블렌딩이 "캐시된 것은 바로, 미캐시는 상한만큼만 조회"를 정하는 데 쓴다
+ * (작업 지시서 20261010_02 §3-1).
+ * @returns 캐시된 요약. 캐시에 없으면 undefined.
+ */
+export function peekReviewSummary(appId: number): ReviewSummary | undefined {
+  const cached = cacheGet<ReviewSummary>(`reviewsummary:${appId}`);
+  return cached ? cached.data : undefined;
 }
 
 /**
@@ -548,6 +975,25 @@ export async function searchGames(
   const res = await fetchJson<SteamStoreSearchResponse>(url);
 
   return res?.items ?? [];
+}
+
+/**
+ * appid들의 메타가 영속 캐시에 신선하게(appInfo TTL 이내) 있는지 집합으로 돌려준다.
+ *
+ * getAppDetails는 이 row들을 API 호출·딜레이 없이 hydrate하므로, /recommend가 "즉시 처리 가능한
+ * 앱 먼저"로 조회 순서를 정하는 데 쓴다. 인메모리 LRU는 보지 않는다 — LRU에 들어간 앱은 신규
+ * 조회 시 영속 캐시에도 함께 저장되므로 영속 캐시가 상위 집합이다. (LRU를 cacheGet으로 들여다보면
+ * allowStale 항목이 삭제되는 부작용도 있다.)
+ *
+ * DB 오류 시 빈 집합 — 순서 최적화만 잃고 동작은 그대로(전부 미캐시 취급).
+ */
+export function getCachedAppDetailsIds(): Set<number> {
+  try {
+    return getFreshAppIdsInStore(Date.now() - CACHE_TTL.appInfo);
+  } catch (err) {
+    console.warn("[steam-api] app_details_cache id scan failed:", err);
+    return new Set();
+  }
 }
 
 /**

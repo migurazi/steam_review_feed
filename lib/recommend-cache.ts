@@ -29,6 +29,11 @@ export interface RecommendationCachePayload {
   ownedGames: number;
   wishlistGames: number;
   wishlistFetchFailed: boolean;
+  /**
+   * 미보유 할인 게임 발굴 결과 (tracks.deal, 작업 지시서 20261010_01 단계 2).
+   * undefined = 발굴을 요청하지 않았거나 결과가 없음(진행 중 이탈·실패). 구 row 파싱 호환.
+   */
+  storeDeals?: Recommendation[];
 }
 
 export interface RecommendationCacheEntry {
@@ -44,7 +49,7 @@ export interface RecommendationCacheEntry {
  */
 export interface CacheKeyInput {
   options: AnalyzeOptions;
-  tracks: { lib: boolean; wish: boolean };
+  tracks: { lib: boolean; wish: boolean; deal?: boolean };
 }
 
 /**
@@ -68,7 +73,13 @@ export function hashOptions(input: CacheKeyInput): string {
   const optsPart = optKeys
     .map(k => `${k}=${JSON.stringify(opts[k])}`)
     .join(",");
-  const tracksPart = `lib=${input.tracks.lib ? 1 : 0},wish=${input.tracks.wish ? 1 : 0}`;
+  // deal은 true일 때만 덧붙인다 — 발굴 트랙을 쓰지 않는 요청의 tracks 부분 형식을 바꾸지 않기
+  // 위함이다 (작업 지시서 20261010_01 §2-5). 단, 같은 작업의 단계 1에서 AnalyzeOptions에
+  // valueWeighting·saleOnly가 추가되어 optsPart가 이미 달라졌으므로, 이 변경 이전에 저장된
+  // 캐시 row는 배포 후 한 번씩 miss된다 (§1-3 "기존 캐시 row는 1회 miss" — 재분석이 덮어씀).
+  const tracksPart =
+    `lib=${input.tracks.lib ? 1 : 0},wish=${input.tracks.wish ? 1 : 0}` +
+    (input.tracks.deal ? ",deal=1" : "");
   return `${optsPart}|${tracksPart}`;
 }
 

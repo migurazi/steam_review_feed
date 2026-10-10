@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getAppDetails, getAppPrice } from "@/lib/steam/api";
+import { getAppDetails, getAppPriceSnapshot } from "@/lib/steam/api";
 import { cacheGet } from "@/lib/cache";
 import type { SteamAppDetails } from "@/lib/steam/types";
 
@@ -11,7 +11,10 @@ import type { SteamAppDetails } from "@/lib/steam/types";
  * 세일 시작/종료에 빠르게 반응한다.
  *
  * 응답:
- *   { isFree: boolean, price: SteamPriceOverview | null }
+ *   { isFree: boolean, price: SteamPriceOverview | null, priceFetchedAt: number | null,
+ *     comingSoon: boolean, releaseDate: string | null }
+ *   priceFetchedAt: 가격을 확인한 시각(Unix ms). 조회 장애 시 마지막으로 확인한 가격이 원래 시각과
+ *   함께 온다 — 화면이 1시간 초과분을 회색으로 구분 (작업 지시서 20261010_02 §2-2).
  */
 export async function GET(
   _req: NextRequest,
@@ -24,18 +27,23 @@ export async function GET(
     return NextResponse.json({ error: "Invalid appId" }, { status: 400 });
   }
 
-  const price = await getAppPrice(appId);
-
   // is_free / release_date는 appInfo 캐시에서 확인. 캐시 미스면 getAppDetails 호출.
+  // 가격보다 먼저 한다 — getAppDetails의 신규 조회는 가격 캐시도 함께 채우므로, 이어지는
+  // getAppPrice가 캐시 히트가 되어 store 호출이 한 번으로 끝난다.
   let cachedInfo = cacheGet<SteamAppDetails>(`app:${appId}:info:KR`)?.data;
   if (!cachedInfo) {
     const details = await getAppDetails(appId);
     cachedInfo = details?.data;
   }
 
+  // 스냅샷: 캐시가 있으면 즉시(묵었으면 원래 시각과 함께), 없을 때만 store를 기다린다
+  // (작업 지시서 20261010_02 §2). priceFetchedAt으로 화면이 묵은 가격을 회색 처리한다.
+  const snapshot = await getAppPriceSnapshot(appId);
+
   return NextResponse.json({
     isFree: cachedInfo?.is_free ?? false,
-    price: price ?? null,
+    price: snapshot?.price ?? null,
+    priceFetchedAt: snapshot?.fetchedAt ?? null,
     comingSoon: cachedInfo?.release_date?.coming_soon ?? false,
     releaseDate: cachedInfo?.release_date?.date ?? null,
   });

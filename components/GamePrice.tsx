@@ -10,6 +10,13 @@ interface GamePriceProps {
   /** "compact"=피드 헤더용 작은 크기, "full"=상세 페이지용 큰 크기 */
   variant?: 'compact' | 'full';
   className?: string;
+  /**
+   * 묵은 가격 여부. true면 회색으로 표시하고 할인 강조를 끈다 — 저장된 분석 결과의
+   * 가격이 신선도 기준(PRICE_STALE_MS)을 넘은 경우 (작업 지시서 20261010_01 §1-5).
+   */
+  stale?: boolean;
+  /** stale일 때 툴팁 문구 (예: "3시간 전 가격"). */
+  staleLabel?: string;
 }
 
 /**
@@ -27,6 +34,8 @@ export default function GamePrice({
   releaseDate,
   variant = 'compact',
   className = '',
+  stale = false,
+  staleLabel,
 }: GamePriceProps) {
   const isCompact = variant === 'compact';
   const baseSize = isCompact ? 'text-xs' : 'text-base';
@@ -58,6 +67,21 @@ export default function GamePrice({
   if (!price) return null;
 
   const onSale = price.discount_percent > 0;
+
+  // 묵은 가격: 할인 여부와 무관하게 회색 단색으로, 강조 없이 표시한다.
+  if (stale) {
+    const staleTitle = `${staleLabel ?? '이전 가격'} — 현재 가격과 다를 수 있습니다`;
+    return (
+      <span
+        title={staleTitle}
+        className={`inline-flex items-center gap-1.5 text-gray-400 dark:text-gray-500 ${baseSize} ${className}`}
+      >
+        {onSale && <span className="tabular-nums">-{price.discount_percent}%</span>}
+        <span>{price.final_formatted || price.initial_formatted}</span>
+        <span className="sr-only">({staleTitle})</span>
+      </span>
+    );
+  }
 
   if (!onSale) {
     return (

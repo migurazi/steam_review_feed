@@ -83,15 +83,16 @@ export interface SteamScreenshot {
  * appdetails API의 가격 정보. cc=KR로 호출 시 KRW 단위.
  * is_free=true이거나 미출시/지역제한 게임은 응답에 미포함.
  *
- * 주의: KRW는 initial/final이 원 단위 그대로 (예: 30000=₩30,000),
- * USD/EUR 등은 1/100 단위(cent). UI에서는 *_formatted 필드 사용 권장.
+ * 주의: KRW 포함 모든 통화에서 initial/final은 1/100 단위다
+ * (예: 5490000=₩54,900 — 2026-10-10 cc=KR 실응답 확인, 작업 지시서 20261010_01 V5).
+ * 할인 없는 응답은 initial_formatted가 빈 문자열이다. UI에서는 *_formatted 필드 사용 권장.
  */
 export interface SteamPriceOverview {
   /** 통화 코드 (예: "KRW") */
   currency: string;
-  /** 정가 (KRW는 원 단위) */
+  /** 정가 (1/100 단위, 예: 5490000=₩54,900) */
   initial: number;
-  /** 최종 가격 (KRW는 원 단위) */
+  /** 최종 가격 (1/100 단위) */
   final: number;
   /** 할인율 (%). 0=할인 없음 */
   discount_percent: number;
@@ -99,6 +100,112 @@ export interface SteamPriceOverview {
   initial_formatted: string;
   /** 최종 가격 표시 문자열 (예: "₩15,000") */
   final_formatted: string;
+}
+
+/**
+ * appdetails `filters=price_overview` 다중 appid 응답.
+ * 무료/미판매 게임은 `data: []`(빈 배열), 없는 appid는 `success: false`로 온다
+ * (단계 0 V1 실응답, __tests__/fixtures/steam-stage0/v1_multi5.json).
+ */
+export type SteamPriceBatchResponse = Record<
+  string,
+  { success: boolean; data?: { price_overview?: SteamPriceOverview } | unknown[] }
+>;
+
+/**
+ * 추천용 가격 스냅샷 (작업 지시서 20261010_01 §1-1).
+ * Map에 스냅샷이 없는 appid = 가격 미상(조회 실패). price=null은 "확인된 무료/미판매".
+ */
+export interface PriceSnapshot {
+  price: SteamPriceOverview | null;
+  /** 가격을 가져온 시각 (Unix ms) */
+  fetchedAt: number;
+  /**
+   * 이번 조회가 실패해 마지막으로 확인한 가격(last-known·만료 캐시)으로 채웠다 (작업 지시서 20261010_02).
+   * 표시는 하되(회색) 위시 가격 커버리지 판정에는 세지 않는다 — 장애 중 묵은 할인율이 가성비
+   * 순위·saleOnly를 조용히 바꾸지 않도록.
+   */
+  fallback?: boolean;
+}
+
+// --- 스토어 할인 발굴 (작업 지시서 20261010_01 단계 2) ---
+
+/**
+ * store.steampowered.com/search/results/?json=1&infinite=1 응답.
+ * results_html은 검색 결과 행(<a ... data-ds-appid="...">) HTML 조각이다.
+ * appid 정수 추출에만 쓰고 저장·전달하지 않는다 (단계 0 V3, fixtures/v4_reviews_p0.json).
+ */
+export interface SteamSearchResultsResponse {
+  success: number;
+  results_html: string;
+  total_count: number;
+  start: number;
+}
+
+/** store.steampowered.com/api/featuredcategories 응답 중 specials 부분만 (V3(b) fallback). */
+export interface SteamFeaturedCategoriesResponse {
+  specials?: {
+    items?: { id: number; type: number; discounted?: boolean; discount_percent?: number }[];
+  };
+}
+
+/**
+ * IStoreBrowseService/GetItems/v1 응답의 store_item 중 사용하는 필드만.
+ * (단계 0 V2, fixtures/v2_getitems_nokey.json). 금액은 문자열 1/100 단위.
+ */
+export interface SteamStoreBrowseItem {
+  appid?: number;
+  id?: number;
+  /** 1=성공 */
+  success: number;
+  name?: string;
+  is_free?: boolean;
+  categories?: {
+    supported_player_categoryids?: number[];
+    feature_categoryids?: number[];
+    controller_categoryids?: number[];
+  };
+  reviews?: {
+    /** 언어 무관 집계. appreviews filter=all과 집계 방식이 조금 다르다 (부록 B 설계 확정 4). */
+    summary_filtered?: {
+      review_count: number;
+      percent_positive: number;
+      review_score: number;
+      review_score_label: string;
+    };
+  };
+  best_purchase_option?: {
+    final_price_in_cents?: string;
+    original_price_in_cents?: string;
+    formatted_final_price?: string;
+    formatted_original_price?: string;
+    discount_pct?: number;
+    active_discounts?: { discount_end_date?: number }[];
+    hide_discount_pct_for_compliance?: boolean;
+    price_cannot_be_displayed_as_discount?: boolean;
+  };
+}
+
+export interface SteamStoreBrowseResponse {
+  response?: { store_items?: SteamStoreBrowseItem[] };
+}
+
+/**
+ * GetItems 한 항목을 정규화한 스토어 요약 (발굴 트랙 전용).
+ * price=null은 "구매 옵션 없음(무료/미판매)", review=null은 "리뷰 요약 없음".
+ */
+export interface StoreItemSummary {
+  appid: number;
+  price: SteamPriceOverview | null;
+  /** 리뷰 요약. 기존 computeReviewScore/buildReviewBadge 입력 형식으로 환산해 둔다. */
+  review: ReviewSummary | null;
+  /** supported_player + feature + controller 카테고리 id (appdetails 카테고리 id와 동일 체계). */
+  categoryIds: number[];
+  isFree: boolean;
+  /** 진행 중인 할인 종료 시각 (Unix 초). 할인이 없거나 미상이면 undefined. */
+  discountEndsAt?: number;
+  /** 조회 시각 (Unix ms) */
+  fetchedAt: number;
 }
 
 /** appdetails API의 출시일 정보. coming_soon=true면 미출시. */

@@ -64,6 +64,19 @@ export function setAppDetailsInStore(appId: number, details: SteamAppDetails): v
 }
 
 /**
+ * fetched_at이 minFetchedAt보다 새로운 row의 app_id 집합 (= 즉시 hydrate 가능한 앱).
+ *
+ * /recommend가 메타 조회 순서를 정할 때 "캐시된 것 먼저(즉시) → 미캐시는 1.5s 직렬"로 나누는 데
+ * 쓴다. 본문(details)은 읽지 않고 정수 컬럼만 스캔하므로 수천 row에서도 가볍다.
+ */
+export function getFreshAppIdsInStore(minFetchedAt: number): Set<number> {
+  const rows = getDb()
+    .prepare("SELECT app_id FROM app_details_cache WHERE fetched_at > ?")
+    .all(minFetchedAt) as { app_id: number }[];
+  return new Set(rows.map(r => r.app_id));
+}
+
+/**
  * 테스트/디버깅용 명시적 삭제.
  */
 export function deleteAppDetailsFromStore(appId: number): void {

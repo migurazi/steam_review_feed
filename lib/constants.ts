@@ -90,6 +90,41 @@ export const ACHIEVEMENT_DAILY_CALL_BUDGET = 80_000;
 export const STREAM_CONCURRENCY = 1;
 
 /**
+ * 가격 신선도 기준 (ms). 가격 캐시 TTL(CACHE_TTL.appPrice)과 클라이언트의 "묵은 가격"
+ * 표시 기준을 한 값으로 묶어 둘이 어긋나지 않게 한다. 클라이언트도 import하므로
+ * 이 파일은 서버 전용 의존을 갖지 않아야 한다. (작업 지시서 20261010_01 §1-5)
+ */
+export const PRICE_STALE_MS = 60 * 60 * 1000;
+
+/**
+ * appdetails `filters=price_overview` 다중 appid 1회 조회 개수.
+ * 단계 0 V1에서 191개까지 동작 확인 — URL 길이·여유를 고려해 100으로 둔다.
+ */
+export const PRICE_BATCH_SIZE = 100;
+
+/**
+ * last-known 가격 보관 기간 (ms). 가격 조회가 실패할 때 "마지막으로 확인한 가격"을 회색으로 계속
+ * 보여줄 수 있는 상한. 이보다 오래된 가격은 끝난 할인을 할인 중으로 보여줄 위험이 커 미상으로 둔다.
+ * (작업 지시서 20261010_02 §1-1)
+ */
+export const PRICE_LAST_KNOWN_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 미보유 할인 게임 발굴 트랙 상한 (작업 지시서 20261010_01 단계 2, 부록 B 설계 확정 3·4).
+ *   - DISCOVER_POOL_SIZE:       검색 specials에서 모을 후보 appid 수 (페이지 100개 → 2회 호출).
+ *   - DISCOVER_SEARCH_PAGE_SIZE: 검색 1페이지 행 수. V4에서 count=100이 한 번에 100행 반환 확인.
+ *   - DISCOVER_META_CAP:        장르 메타(appdetails, 1.5s 직렬)를 조회할 후보 수. GetItems는
+ *                               장르를 주지 않으므로 이 단계가 발굴 비용의 대부분이다.
+ *   - DISCOVER_TIME_BUDGET_MS:  발굴 단계 전체 시간 예산. 초과 시 확보한 데이터로 진행.
+ *   - STORE_ITEMS_BATCH_SIZE:   GetItems 1회 조회 appid 수. V2에서 100개/호출 ~0.2s 확인.
+ */
+export const DISCOVER_POOL_SIZE = 150;
+export const DISCOVER_SEARCH_PAGE_SIZE = 100;
+export const DISCOVER_META_CAP = 40;
+export const DISCOVER_TIME_BUDGET_MS = 120_000;
+export const STORE_ITEMS_BATCH_SIZE = 100;
+
+/**
  * 필터 기본값.
  * FilterPanel의 DEFAULT_FILTERS와 서버 측 DEFAULTS를 통합한다.
  */

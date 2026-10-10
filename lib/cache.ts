@@ -9,6 +9,7 @@
  */
 
 import { LRUCache } from "lru-cache";
+import { PRICE_STALE_MS, PRICE_LAST_KNOWN_TTL_MS } from "@/lib/constants";
 
 /** 캐시에 저장되는 래퍼. fetchedAt으로 stale 여부를 판단한다. */
 interface CacheValue<T> {
@@ -38,8 +39,11 @@ export const CACHE_TTL = {
   library: 24 * 60 * 60 * 1000,
   /** 앱 상세 정보 (is_free, 이름 등): 7일 */
   appInfo: 7 * 24 * 60 * 60 * 1000,
-  /** 가격 정보: 1시간. 세일 시작/종료에 빠르게 반응하기 위해 짧게 유지. */
-  appPrice: 60 * 60 * 1000,
+  /**
+   * 가격 정보: 1시간. 세일 시작/종료에 빠르게 반응하기 위해 짧게 유지.
+   * 클라이언트의 묵은 가격 표시 기준과 같은 값을 쓰도록 PRICE_STALE_MS를 참조.
+   */
+  appPrice: PRICE_STALE_MS,
   /** 리뷰: 15분 */
   reviews: 15 * 60 * 1000,
   /**
@@ -48,6 +52,12 @@ export const CACHE_TTL = {
    * /recommend 블렌딩 시 반복 조회 비용을 줄인다. (작업 지시서 2-1)
    */
   reviewSummary: 6 * 60 * 60 * 1000,
+  /**
+   * 스토어 할인 후보 목록(store:specials:KR)과 GetItems 요약(storeitem:{id}:KR): 1시간.
+   * 사용자와 무관한 공유 데이터. 가격을 담으므로 가격 캐시와 같은 신선도 기준을 쓴다.
+   * (작업 지시서 20261010_01 단계 2-2)
+   */
+  storeDeals: PRICE_STALE_MS,
   /**
    * 도전과제 스키마(en): 7일. 앱 공용이며 자주 바뀌지 않는다.
    * TTL이 곧 변경 감지 지연의 상한이다 (작업 지시서 20260825_01 §5.5.3, M15).
@@ -125,6 +135,41 @@ export function cacheDeleteByPrefix(prefix: string): void {
       cache.delete(key);
     }
   }
+}
+
+// ============================================================================
+// last-known 가격 전용 캐시 (작업 지시서 20261010_02 §1-1, /code-review 2차 R2)
+// ============================================================================
+
+/**
+ * 마지막으로 확인한 가격 스냅샷 (가격 조회 장애 시 fallback).
+ *
+ * 메인 LRU와 분리한 이유: 가격을 1시간 키 + 24시간 last-known 두 키로 메인 LRU(10,000)에 넣으면
+ * 위시리스트가 큰 사용자 한 명(실사용자 위시 3,736개)만으로 가격 항목이 7,500개를 넘어, 다른
+ * 사용자의 info·라이브러리·리뷰 캐시와 last-known 자신까지 밀어낸다. 스냅샷은 작은 객체라
+ * 별도 인스턴스에 넉넉한 상한을 둔다(항목당 수백 바이트 × 50,000 ≈ 수십 MB 이하).
+ *
+ * allowStale 없음 — 24시간이 지난 가격은 fallback으로도 쓰지 않는다(끝난 할인 방지).
+ */
+export interface LastKnownPrice<P> {
+  price: P;
+  /** 가격을 확인한 시각 (Unix ms) */
+  fetchedAt: number;
+}
+
+const lastKnownPrices = new LRUCache<number, LastKnownPrice<unknown>>({
+  max: 50_000,
+  ttl: PRICE_LAST_KNOWN_TTL_MS,
+});
+
+/** last-known 가격 조회. 없거나 24시간이 지났으면 null. */
+export function lastKnownPriceGet<P>(appId: number): LastKnownPrice<P> | null {
+  return (lastKnownPrices.get(appId) as LastKnownPrice<P> | undefined) ?? null;
+}
+
+/** last-known 가격 기록 (TTL 24시간, 기록할 때마다 갱신). */
+export function lastKnownPriceSet<P>(appId: number, snapshot: LastKnownPrice<P>): void {
+  lastKnownPrices.set(appId, snapshot);
 }
 
 /**

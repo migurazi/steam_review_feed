@@ -22,22 +22,53 @@ import ThemeToggle from '@/components/ThemeToggle';
 import ProgressBar from '@/components/ProgressBar';
 import AppNav from '@/components/AppNav';
 import AppFooter from '@/components/AppFooter';
-import { DEFAULT_ANALYZE_OPTIONS, type AnalyzeOptions, type TasteProfile, type Recommendation, type ReviewBadge } from '@/lib/steam/profile';
+import GamePrice from '@/components/GamePrice';
+import {
+  DEFAULT_ANALYZE_OPTIONS,
+  REVIEW_BADGE_MIN_SAMPLE,
+  type AnalyzeOptions,
+  type TasteProfile,
+  type Recommendation,
+  type ReviewBadge,
+} from '@/lib/steam/profile';
+import { isPriceStale, formatRelativeTime, formatPriceAge } from '@/lib/price-display';
+
+/**
+ * 페이지 옵션 = 분석 옵션 + 트랙 선택.
+ * discoverDeals는 AnalyzeOptions가 아니라 요청 tracks(deal)로 보낸다 — 서버 캐시 키에서
+ * tracks는 별도 차원이고, 순수 분석 함수는 이 값을 쓰지 않기 때문 (작업 지시서 20261010_01 §2-5).
+ */
+interface PageOptions extends AnalyzeOptions {
+  /** 미보유 할인 게임 발굴 트랙 (opt-in). 첫 실행 1–2분 추가. */
+  discoverDeals: boolean;
+}
 
 // UI default = lib default + 사용자 친화적 override.
 // lib의 DEFAULT_ANALYZE_OPTIONS를 그대로 import해 미래 옵션 필드 추가/기본값
 // 변경이 자동 반영되도록 한다. UI에서 다르게 시작할 필드만 명시적으로 override.
-const DEFAULT_OPTIONS: AnalyzeOptions = {
+const DEFAULT_OPTIONS: PageOptions = {
   ...DEFAULT_ANALYZE_OPTIONS,
   // 무료 게임은 대부분 free-to-play 형태로 대량 진입했다가 안 하는 경우가 많아
   // 추천 노이즈가 크다. 사용자 시그널: UI 진입 시 기본 체크.
   excludeFree: true,
+  discoverDeals: false,
 };
 
 interface ProgressData { phase: string; loaded: number; total: number; }
-interface ResultData { profile: TasteProfile; libraryUnplayed: Recommendation[]; wishlist: Recommendation[]; }
+/**
+ * wishlist=null: saleOnly 분석의 가격 확인 전 단계. 확정할 수 없으므로 "가격 확인 중"
+ * 플레이스홀더를 그린다 (작업 지시서 20261010_01 §1-4 partial-result).
+ * storeDeals: 발굴 트랙 결과. undefined = 아직 없음(발굴 미요청·진행 중·이전 결과 없음).
+ */
+interface ResultData {
+  profile: TasteProfile;
+  libraryUnplayed: Recommendation[];
+  wishlist: Recommendation[] | null;
+  storeDeals?: Recommendation[];
+}
 interface PartialResultData extends ResultData { loaded: number; total: number; }
-interface CachedData extends ResultData {
+interface CachedData extends Omit<ResultData, 'wishlist'> {
+  wishlist: Recommendation[];
   ownedGames: number;
   wishlistGames: number;
   wishlistFetchFailed: boolean;
@@ -52,9 +83,35 @@ interface DoneData {
   analysisInsufficient: boolean;
   metaMissingDominant?: boolean;
   libraryFetchFailed?: boolean;
+  /** 위시 가격 커버리지 부족 — "할인 게임 없음" 대신 가격 실패 안내를 띄운다. */
+  priceFetchFailed?: boolean;
+  /** 발굴 트랙 후보 수집 실패 — "할인 게임 없음" 대신 실패 안내. */
+  storeDealsFailed?: boolean;
+  /** 발굴 트랙 시간 예산 초과 — 일부 후보만 확인했음을 알린다. */
+  storeDealsTruncated?: boolean;
 }
 
-function buildUrl(opts: AnalyzeOptions): string {
+/**
+ * partial-result는 가격 조회 전(match-only)이라 price가 없다. 이전 state(캐시 결과 등)에
+ * 같은 appid의 가격이 있으면 이어 붙여, 메타 수집 단계 동안 가격이 사라지지 않게 한다.
+ * 묵은 가격은 priceFetchedAt 기준으로 카드에서 회색 처리된다.
+ */
+function carryPrices(next: Recommendation[], prev: Recommendation[] | null): Recommendation[] {
+  if (!prev || prev.length === 0) return next;
+  const byId = new Map(prev.map(r => [r.appid, r]));
+  return next.map(r => {
+    if (r.price !== undefined) return r;
+    const old = byId.get(r.appid);
+    return old && old.price !== undefined
+      ? { ...r, price: old.price, priceFetchedAt: old.priceFetchedAt }
+      : r;
+  });
+}
+
+function buildUrl(opts: PageOptions): string {
+  // 트랙은 옵션에서 조립한다. deal은 opt-in일 때만 붙여, 끈 상태의 요청·캐시 해시가
+  // 단계 1과 동일하게 유지되도록 한다.
+  const tracks = opts.discoverDeals ? 'lib,wish,deal' : 'lib,wish';
   const params = new URLSearchParams({
     cardMin: String(opts.cardFarmingMaxMinutes),
     unplayedMax: String(opts.unplayedMaxMinutes),
@@ -62,7 +119,9 @@ function buildUrl(opts: AnalyzeOptions): string {
     topN: String(opts.topNTaste),
     max: String(opts.maxRecommendationsPerTrack),
     fast: String(opts.fastMode),
-    tracks: 'lib,wish',
+    value: String(opts.valueWeighting),
+    saleOnly: String(opts.saleOnly),
+    tracks,
   });
   return `/api/recommend?${params.toString()}`;
 }
@@ -81,7 +140,16 @@ export default function RecommendPage() {
 
 function RecommendContent() {
   const router = useRouter();
-  const [options, setOptions] = useState<AnalyzeOptions>(DEFAULT_OPTIONS);
+  const [options, setOptions] = useState<PageOptions>(DEFAULT_OPTIONS);
+  // 현재 표시 중인 결과를 만든 분석의 옵션. 옵션 변경 후 debounce(500ms) 동안에는
+  // 이전 결과가 그대로 보이므로, 결과 표시 문구는 options가 아니라 이 값을 따른다.
+  const [analyzedOptions, setAnalyzedOptions] = useState<PageOptions>(DEFAULT_OPTIONS);
+  // 이번 분석의 store-deals 이벤트를 받았는지. 받기 전 result.storeDeals는 캐시(이전 분석)
+  // 값이라, 발굴 섹션에 "찾는 중" 표시를 함께 띄우는 근거로 쓴다.
+  const [storeDealsFresh, setStoreDealsFresh] = useState(false);
+  // 이번 분석 store-deals 이벤트의 상태 플래그. done을 기다리지 않고 이벤트에서 바로 받아,
+  // 두 이벤트 사이에 "할인 게임 없음"이 잠깐 보이는 것을 막는다.
+  const [storeDealsStatus, setStoreDealsStatus] = useState({ failed: false, truncated: false });
   const [progress, setProgress] = useState<ProgressData | null>(null);
   const [result, setResult] = useState<ResultData | null>(null);
   // 분석이 아직 진행 중이고 result가 partial-result에서 온 잠정 결과일 때 true.
@@ -118,13 +186,16 @@ function RecommendContent() {
   }, [router]);
 
   // SSE 시작 (debounce)
-  const startAnalysis = useCallback((opts: AnalyzeOptions) => {
+  const startAnalysis = useCallback((opts: PageOptions) => {
+    setAnalyzedOptions(opts);
     if (esRef.current) {
       esRef.current.close();
       esRef.current = null;
     }
     setProgress(null);
     setResult(null);
+    setStoreDealsFresh(false);
+    setStoreDealsStatus({ failed: false, truncated: false });
     setIsProvisional(false);
     setCachedAt(null);
     setDoneData(null);
@@ -147,6 +218,7 @@ function RecommendContent() {
           profile: data.profile,
           libraryUnplayed: data.libraryUnplayed,
           wishlist: data.wishlist,
+          storeDeals: data.storeDeals,
         });
         // doneData를 함께 채워 ResultView가 doneData 분기를 통과하도록 한다.
         // 계약 (producer = lib/recommend route의 tryWriteCache 헬퍼):
@@ -169,16 +241,30 @@ function RecommendContent() {
         setCachedAt(data.computedAt);
       } catch { /* ignore */ }
     });
+    // cached의 발굴 목록 교체본: 서버가 현재 라이브러리·위시리스트로 다시 거른 목록.
+    // 이번 분석의 결과가 아니므로 storeDealsFresh는 건드리지 않는다.
+    es.addEventListener('cached-store-deals', (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as { storeDeals: Recommendation[] };
+        setResult(prev => (prev ? { ...prev, storeDeals: data.storeDeals } : prev));
+      } catch { /* ignore */ }
+    });
     // 잠정 결과: fetch가 진행되는 동안 ~3초 간격으로 들어온다.
     // 같은 ResultData 모양에 loaded/total이 추가되어 있지만 UI는 동일하게 사용.
     es.addEventListener('partial-result', (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data) as PartialResultData;
-        setResult({
+        // wishlist=null(saleOnly 가격 확인 전)이면 이전 위시 state(캐시 결과 등)를 유지한다.
+        // 이전 state도 없으면 null 그대로 → "가격 확인 중" 플레이스홀더.
+        setResult(prev => ({
           profile: data.profile,
           libraryUnplayed: data.libraryUnplayed,
-          wishlist: data.wishlist,
-        });
+          wishlist: data.wishlist
+            ? carryPrices(data.wishlist, prev?.wishlist ?? null)
+            : prev?.wishlist ?? null,
+          // partial에는 발굴 결과가 없다 — 캐시에서 온 이전 발굴 결과를 유지한다.
+          storeDeals: prev?.storeDeals,
+        }));
         setIsProvisional(true);
         // 새 분석의 첫 partial이 도착하면 캐시 표시는 의미를 잃는다.
         setCachedAt(null);
@@ -186,9 +272,31 @@ function RecommendContent() {
     });
     es.addEventListener('result', (e: MessageEvent) => {
       try {
-        setResult(JSON.parse(e.data));
+        const data = JSON.parse(e.data) as ResultData;
+        // result는 라이브러리·위시 트랙만 담는다. 발굴 결과는 뒤이은 store-deals 이벤트가
+        // 채우므로 그 전까지 이전(캐시) 발굴 결과를 유지한다.
+        setResult(prev => ({ ...data, storeDeals: prev?.storeDeals }));
         setIsProvisional(false);
         setCachedAt(null);
+      } catch { /* ignore */ }
+    });
+    // 발굴 트랙 확정 (tracks.deal일 때만, result 이후 · done 이전).
+    es.addEventListener('store-deals', (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as {
+          storeDeals: Recommendation[];
+          failed?: boolean;
+          truncated?: boolean;
+          /** failed일 때만: 현재 라이브러리·위시리스트로 다시 거른 이전 발굴 결과. */
+          previous?: Recommendation[];
+        };
+        const failed = !!data.failed;
+        // 실패면 서버가 다시 거른 이전 결과를 "이전 결과 표시" 안내와 함께 보여준다.
+        // (cached로 받은 목록을 그대로 두면 그 사이 구매·위시 추가한 게임이 남는다)
+        const next = failed ? data.previous : data.storeDeals;
+        setResult(prev => (prev ? { ...prev, storeDeals: next } : prev));
+        setStoreDealsStatus({ failed, truncated: !!data.truncated });
+        setStoreDealsFresh(true);
       } catch { /* ignore */ }
     });
     es.addEventListener('done', (e: MessageEvent) => {
@@ -229,7 +337,7 @@ function RecommendContent() {
   }, [steamId]);
 
   // 옵션 변경 → debounce → 재시작
-  const handleOptionsChange = useCallback((next: AnalyzeOptions) => {
+  const handleOptionsChange = useCallback((next: PageOptions) => {
     setOptions(next);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => startAnalysis(next), 500);
@@ -340,9 +448,12 @@ function RecommendContent() {
           <ResultView
             result={result}
             doneData={doneData}
-            options={options}
+            options={analyzedOptions}
             isProvisional={isProvisional}
             cachedAt={cachedAt}
+            discovering={loading && !storeDealsFresh}
+            storeDealsFresh={storeDealsFresh}
+            storeDealsStatus={storeDealsStatus}
           />
         )}
       </main>
@@ -355,7 +466,10 @@ function phaseLabel(phase: string): string {
   switch (phase) {
     case 'fetching-meta':    return '게임 메타 정보 수집 중';
     case 'fetching-reviews': return '리뷰 평가 수집 중';
+    case 'fetching-prices':  return '가격 확인 중';
     case 'analyzing':        return '성향 분석 중';
+    case 'discovering':        return '할인 게임 찾는 중';
+    case 'fetching-deal-meta': return '할인 게임 정보 확인 중';
     default:                 return phase;
   }
 }
@@ -364,7 +478,7 @@ function phaseLabel(phase: string): string {
 // 옵션 패널
 // ============================================================================
 
-function OptionsPanel({ options, onChange }: { options: AnalyzeOptions; onChange: (o: AnalyzeOptions) => void; }) {
+function OptionsPanel({ options, onChange }: { options: PageOptions; onChange: (o: PageOptions) => void; }) {
   // 슬라이더 변경 시 unplayedMax ≤ cardFarmingMax 자동 클램프
   function setCard(v: number) {
     const u = Math.min(options.unplayedMaxMinutes, v);
@@ -413,6 +527,33 @@ function OptionsPanel({ options, onChange }: { options: AnalyzeOptions; onChange
           />
           <span className="text-gray-700 dark:text-gray-200">빠른 모드</span>
         </label>
+        <label className="flex items-center gap-2 cursor-pointer" title="위시리스트 순위에 현재 할인율과 할인가를 반영합니다. 취향이 여전히 가장 큰 비중입니다.">
+          <input
+            type="checkbox"
+            checked={options.valueWeighting}
+            onChange={(e) => onChange({ ...options, valueWeighting: e.target.checked })}
+            className="w-4 h-4"
+          />
+          <span className="text-gray-700 dark:text-gray-200">가성비 반영 (할인율 가산)</span>
+        </label>
+        <label className="flex items-center gap-2 cursor-pointer" title="위시리스트에서 지금 할인 중인 게임만 보여줍니다.">
+          <input
+            type="checkbox"
+            checked={options.saleOnly}
+            onChange={(e) => onChange({ ...options, saleOnly: e.target.checked })}
+            className="w-4 h-4"
+          />
+          <span className="text-gray-700 dark:text-gray-200">할인 중인 게임만</span>
+        </label>
+        <label className="flex items-center gap-2 cursor-pointer" title="라이브러리·위시리스트에 없는 게임 중 지금 할인 중이고 취향에 맞으며 평이 좋은 게임을 찾습니다.">
+          <input
+            type="checkbox"
+            checked={options.discoverDeals}
+            onChange={(e) => onChange({ ...options, discoverDeals: e.target.checked })}
+            className="w-4 h-4"
+          />
+          <span className="text-gray-700 dark:text-gray-200">미보유 할인 게임 찾기 (첫 실행 1–2분 추가)</span>
+        </label>
         <label className="flex items-center gap-2">
           <span className="text-gray-600 dark:text-gray-300">트랙별 추천 개수</span>
           <select
@@ -457,10 +598,16 @@ function SliderRow({
 // ============================================================================
 
 function ResultView({
-  result, doneData, options, isProvisional, cachedAt,
+  result, doneData, options, isProvisional, cachedAt, discovering, storeDealsFresh, storeDealsStatus,
 }: {
-  result: ResultData; doneData: DoneData | null; options: AnalyzeOptions;
+  result: ResultData; doneData: DoneData | null; options: PageOptions;
   isProvisional: boolean; cachedAt: number | null;
+  /** 이번 분석의 발굴 결과가 아직 도착하지 않았고 분석이 진행 중. */
+  discovering: boolean;
+  /** 이번 분석의 store-deals 이벤트를 받았다(result.storeDeals가 새 결과). */
+  storeDealsFresh: boolean;
+  /** 이번 분석 store-deals 이벤트의 실패/일부 확인 플래그. */
+  storeDealsStatus: { failed: boolean; truncated: boolean };
 }) {
   // analysisInsufficient/metaMissingDominant 분기는 최종(doneData 도착) 시에만.
   // 잠정 단계에서는 profile.analyzedGames가 일시적으로 0이거나 메타 누락이 많을
@@ -515,8 +662,20 @@ function ResultView({
         recs={result.wishlist}
         wishlistGames={doneData?.wishlistGames ?? 0}
         wishlistFetchFailed={doneData?.wishlistFetchFailed ?? false}
+        priceFetchFailed={doneData?.priceFetchFailed ?? false}
+        saleOnly={options.saleOnly}
+        valueWeighting={options.valueWeighting}
         isProvisional={isProvisional}
       />
+      {options.discoverDeals && (
+        <StoreDealSection
+          recs={result.storeDeals}
+          discovering={discovering}
+          fresh={storeDealsFresh}
+          failed={storeDealsStatus.failed}
+          truncated={storeDealsStatus.truncated}
+        />
+      )}
     </>
   );
 }
@@ -539,24 +698,6 @@ function CachedBanner({ computedAt }: { computedAt: number }) {
       </span>
     </div>
   );
-}
-
-/**
- * Unix ms 시각을 "방금", "5분 전", "2시간 전", "어제", "2026-05-25" 등으로 표시.
- * 영어가 아닌 한국어 단위로 표시한다.
- */
-function formatRelativeTime(unixMs: number): string {
-  const diffSec = Math.max(0, Math.floor((Date.now() - unixMs) / 1000));
-  if (diffSec < 60) return '방금 전';
-  const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin}분 전`;
-  const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return `${diffHr}시간 전`;
-  const diffDay = Math.floor(diffHr / 24);
-  if (diffDay < 7) return `${diffDay}일 전`;
-  const d = new Date(unixMs);
-  // 7일 이상 지나면 절대 날짜
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 // ============================================================================
@@ -642,26 +783,41 @@ function TrackSection({
 }
 
 function WishlistSection({
-  recs, wishlistGames, wishlistFetchFailed, isProvisional,
+  recs: recsOrNull, wishlistGames, wishlistFetchFailed, priceFetchFailed, saleOnly, valueWeighting, isProvisional,
 }: {
-  recs: Recommendation[]; wishlistGames: number; wishlistFetchFailed: boolean; isProvisional: boolean;
+  recs: Recommendation[] | null; wishlistGames: number; wishlistFetchFailed: boolean;
+  priceFetchFailed: boolean; saleOnly: boolean; valueWeighting: boolean; isProvisional: boolean;
 }) {
+  const recs = recsOrNull ?? [];
   // 잠정 단계에서는 wishlistGames/wishlistFetchFailed가 아직 확정 아님 → 잠정 메시지 우선.
+  // 가격 실패를 "할인 게임 없음"으로 표시하지 않는다 (작업 지시서 20261010_01 정직성 제약).
   let emptyMessage: string;
-  if (isProvisional) {
-    emptyMessage = '잠정 결과를 기다리는 중입니다. 위시리스트는 라이브러리 메타가 끝난 뒤 채워집니다.';
+  if (recsOrNull === null) {
+    emptyMessage = '가격 확인 중… 분석이 끝나면 할인 중인 위시리스트 게임이 표시됩니다.';
+  } else if (isProvisional) {
+    emptyMessage = '잠정 결과를 기다리는 중입니다. 위시리스트 게임 정보를 확인하는 중입니다.';
   } else if (wishlistFetchFailed) {
     emptyMessage = '위시리스트를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.';
   } else if (wishlistGames === 0) {
     emptyMessage = '위시리스트가 비어있습니다.';
+  } else if (saleOnly && priceFetchFailed) {
+    emptyMessage = '가격 정보를 가져오지 못했습니다. 잠시 후 다시 분석해 주세요.';
+  } else if (saleOnly) {
+    emptyMessage = '지금 할인 중인 위시리스트 게임이 없습니다.';
   } else {
     emptyMessage = '위시리스트에서 성향과 일치하는 게임을 찾지 못했습니다.';
   }
   return (
     <section className="space-y-3">
       <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200">
-        위시리스트 중 성향에 맞는 게임 {recs.length > 0 ? `(${recs.length})` : ''}
+        {saleOnly ? '위시리스트 중 할인 중이고 성향에 맞는 게임' : '위시리스트 중 성향에 맞는 게임'} {recs.length > 0 ? `(${recs.length})` : ''}
       </h2>
+      {/* 결과가 있는데 가격 조회가 실패한 경우: 가성비 반영 없이 기존 순위임을 알린다. */}
+      {!isProvisional && valueWeighting && priceFetchFailed && recs.length > 0 && (
+        <p className="text-xs text-amber-700 dark:text-amber-400">
+          가격 정보를 가져오지 못해 할인 반영 없이 정렬했습니다.
+        </p>
+      )}
       {recs.length === 0 ? (
         <p className="text-sm text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/50 rounded-lg p-4">
           {emptyMessage}
@@ -675,7 +831,75 @@ function WishlistSection({
   );
 }
 
+/**
+ * 트랙 C: 미보유 할인 게임 (작업 지시서 20261010_01 단계 2-6).
+ *
+ * 상태 문구 (정직성 제약 — 실패·예산 초과를 "할인 게임 없음"으로 표시하지 않음):
+ *   - 발굴 진행 중: 결과가 없으면 "할인 게임 찾는 중", 있으면(이전 캐시) 위에 갱신 중 안내.
+ *   - 실패: "할인 목록을 가져오지 못했습니다".
+ *   - 예산 초과: "일부 후보만 확인했습니다" (결과와 함께 또는 단독).
+ *   - 정상 0건: "취향에 맞는 할인 게임이 없습니다".
+ */
+function StoreDealSection({
+  recs, discovering, fresh, failed, truncated,
+}: {
+  recs: Recommendation[] | undefined; discovering: boolean; fresh: boolean;
+  failed: boolean; truncated: boolean;
+}) {
+  const list = recs ?? [];
+  let emptyMessage: string;
+  if (discovering) {
+    emptyMessage = '할인 게임 찾는 중… 라이브러리·위시리스트 분석이 끝난 뒤 진행됩니다.';
+  } else if (!fresh) {
+    // 분석이 store-deals 전에 끝남(오류·라이브러리 조회 실패 등). "없음"이라고 단정하지 않는다.
+    emptyMessage = '이번 분석에서는 할인 게임을 확인하지 못했습니다.';
+  } else if (failed) {
+    emptyMessage = '할인 목록을 가져오지 못했습니다. 잠시 후 다시 분석해 주세요.';
+  } else if (truncated) {
+    emptyMessage = '일부 후보만 확인했습니다. 확인한 후보 중에는 취향에 맞는 할인 게임이 없습니다.';
+  } else {
+    emptyMessage = '취향에 맞는 할인 게임이 없습니다.';
+  }
+  return (
+    <section className="space-y-3">
+      <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200">
+        취향 맞는 할인 게임 {list.length > 0 ? `(${list.length})` : ''}
+      </h2>
+      {list.length > 0 && discovering && (
+        <p className="text-xs text-gray-500 dark:text-gray-400">이전 결과입니다. 새로 찾는 중…</p>
+      )}
+      {list.length > 0 && !discovering && failed && (
+        <p className="text-xs text-amber-700 dark:text-amber-400">할인 목록을 가져오지 못해 이전 결과를 표시합니다.</p>
+      )}
+      {list.length > 0 && !discovering && !failed && truncated && (
+        <p className="text-xs text-amber-700 dark:text-amber-400">시간 제한으로 일부 후보만 확인했습니다.</p>
+      )}
+      {list.length === 0 ? (
+        <p className="text-sm text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/50 rounded-lg p-4">
+          {emptyMessage}
+        </p>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {list.map(r => <RecommendCard key={r.appid} rec={r} />)}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** 할인 종료까지 남은 시간 표시. 지났거나 7일 넘게 남았으면 표시하지 않는다(정보 가치 낮음). */
+function formatDiscountEnds(endsAtSec: number | undefined): string | null {
+  if (endsAtSec === undefined) return null;
+  const diffMs = endsAtSec * 1000 - Date.now();
+  if (diffMs <= 0) return null;
+  const hours = Math.floor(diffMs / (60 * 60 * 1000));
+  if (hours < 24) return hours <= 0 ? '곧 할인 종료' : `${hours}시간 후 할인 종료`;
+  const days = Math.floor(hours / 24);
+  return days > 7 ? null : `${days}일 후 할인 종료`;
+}
+
 function RecommendCard({ rec }: { rec: Recommendation }) {
+  const discountEnds = rec.source === 'store-deal' ? formatDiscountEnds(rec.discountEndsAt) : null;
   const storeUrl = `https://store.steampowered.com/app/${rec.appid}/`;
   return (
     <a
@@ -703,6 +927,21 @@ function RecommendCard({ rec }: { rec: Recommendation }) {
             </span>
           ))}
         </div>
+        {/* 가격: 위시리스트 트랙에서 가격을 조회한 경우만(undefined=미상 → 미표시).
+            1시간(PRICE_STALE_MS) 넘은 캐시 가격은 회색으로 구분한다. */}
+        {rec.price !== undefined && (rec.price !== null || rec.isFree || rec.comingSoon) && (
+          <div className="min-h-[1.5rem] flex items-center">
+            <GamePrice
+              price={rec.price ?? undefined}
+              isFree={rec.isFree}
+              // 가격이 있으면(예약 구매 할인 등) 가격을 우선 표시 — GamePrice는 comingSoon을
+              // 가격보다 먼저 그리므로, 가격이 없을 때만 "출시 예정"으로 대체한다.
+              comingSoon={rec.price === null && rec.comingSoon}
+              stale={isPriceStale(rec.priceFetchedAt)}
+              staleLabel={formatPriceAge(rec.priceFetchedAt)}
+            />
+          </div>
+        )}
         <div className="flex items-center justify-between gap-2 text-xs text-gray-500 dark:text-gray-400">
           <span>
             {rec.source === 'library-unplayed' && (
@@ -711,6 +950,7 @@ function RecommendCard({ rec }: { rec: Recommendation }) {
                 : `${rec.playtimeMinutes}분 플레이`
             )}
             {rec.source === 'wishlist' && '위시리스트'}
+            {rec.source === 'store-deal' && (discountEnds ? `스토어 할인 · ${discountEnds}` : '스토어 할인')}
           </span>
           {rec.reviewBadge && <ReviewBadgeChip badge={rec.reviewBadge} />}
         </div>
@@ -718,9 +958,6 @@ function RecommendCard({ rec }: { rec: Recommendation }) {
     </a>
   );
 }
-
-/** 저표본 기준: 이 미만이면 호평 %를 단정하지 않고 표본 수만 노출한다. */
-const REVIEW_BADGE_MIN_SAMPLE = 10;
 
 /**
  * 호평률 배지 칩.

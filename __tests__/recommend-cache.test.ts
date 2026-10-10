@@ -92,10 +92,25 @@ describe("hashOptions", () => {
     expect(libOnly).not.toBe(wishOnly);
   });
 
+  it("deal 미지정/false면 기존(단계 1) 해시 문자열과 동일, true면 분리 (작업 지시서 20261010_01 §2-5)", () => {
+    const legacy = hashOptions({ options: DEFAULT_ANALYZE_OPTIONS, tracks: { lib: true, wish: true } });
+    const dealOff = hashOptions({ options: DEFAULT_ANALYZE_OPTIONS, tracks: { lib: true, wish: true, deal: false } });
+    const dealOn = hashOptions({ options: DEFAULT_ANALYZE_OPTIONS, tracks: { lib: true, wish: true, deal: true } });
+    expect(dealOff).toBe(legacy);
+    expect(legacy.endsWith("|lib=1,wish=1")).toBe(true);
+    expect(dealOn).toBe(`${legacy},deal=1`);
+  });
+
   it("fastMode 차이는 캐시 키를 분리한다 (빠른/전체 결과 미충돌)", () => {
     const full = h({ ...DEFAULT_ANALYZE_OPTIONS, fastMode: false });
     const fast = h({ ...DEFAULT_ANALYZE_OPTIONS, fastMode: true });
     expect(full).not.toBe(fast);
+  });
+
+  it("valueWeighting/saleOnly 차이는 캐시 키를 분리한다 (작업 지시서 20261010_01 §1-3)", () => {
+    const base = h({ ...DEFAULT_ANALYZE_OPTIONS });
+    expect(h({ ...DEFAULT_ANALYZE_OPTIONS, valueWeighting: false })).not.toBe(base);
+    expect(h({ ...DEFAULT_ANALYZE_OPTIONS, saleOnly: true })).not.toBe(base);
   });
 
   it("키 순서에 영향받지 않는다 (객체 spread 순서 무관)", () => {
@@ -108,8 +123,12 @@ describe("hashOptions", () => {
       topNTaste: 6,
       maxRecommendationsPerTrack: 12,
       fastMode: false,
+      valueWeighting: true,
+      saleOnly: false,
     };
     const b: AnalyzeOptions = {
+      saleOnly: false,
+      valueWeighting: true,
       fastMode: false,
       maxRecommendationsPerTrack: 12,
       topNTaste: 6,

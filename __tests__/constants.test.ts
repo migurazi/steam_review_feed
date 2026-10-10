@@ -15,7 +15,10 @@ import {
   STEAM_API_DELAY,
   STREAM_CONCURRENCY,
   DEFAULT_FILTER_VALUES,
+  PRICE_STALE_MS,
+  PRICE_BATCH_SIZE,
 } from "@/lib/constants";
+import { CACHE_TTL } from "@/lib/cache";
 
 describe("constants", () => {
   it("PAGE_SIZE는 50이다 (기획서 기반)", () => {
@@ -56,5 +59,14 @@ describe("constants", () => {
     expect(DEFAULT_FILTER_VALUES.minLength).toBe(0);
     expect(DEFAULT_FILTER_VALUES.reviewType).toBe("all");
     expect(DEFAULT_FILTER_VALUES.offset).toBe(0);
+  });
+
+  it("가격 신선도 기준은 1시간이고 가격 캐시 TTL과 같다 (작업 지시서 20261010_01 §1-5)", () => {
+    expect(PRICE_STALE_MS).toBe(60 * 60 * 1000);
+    expect(CACHE_TTL.appPrice).toBe(PRICE_STALE_MS);
+  });
+
+  it("가격 배치 크기는 100이다 (단계 0 V1: 191개까지 동작 확인)", () => {
+    expect(PRICE_BATCH_SIZE).toBe(100);
   });
 });

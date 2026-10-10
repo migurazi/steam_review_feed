@@ -31,9 +31,22 @@
  *   최종 순위 = W_MATCH·matchScore + W_REVIEW·reviewScore.
  *   reviewScore는 호평률 정규화값. 순수 함수 computeReviewScore/blendRecommendations가
  *   담당하고, 리뷰 요약 조회(I/O)는 라우트 책임 (본 모듈 순수성 유지).
+ *
+ * 가성비·할인 발굴 (작업 지시서 20261010_01):
+ *   위시 트랙은 valueWeighting이면 W_MATCH_V·match + W_REVIEW_V·review + W_DEAL·deal.
+ *   store-deal 트랙(미보유 할인 게임)은 항상 가성비 산식. 후보 수집·정규화는 deals.ts,
+ *   매칭(recommendStoreDeals)은 scoreAgainstProfile을 공유하기 위해 이 모듈에 둔다.
  */
 
-import type { SteamOwnedGame, SteamWishlistItem, SteamAppDetails, ReviewSummary } from "./types";
+import type {
+  SteamOwnedGame,
+  SteamWishlistItem,
+  SteamAppDetails,
+  SteamPriceOverview,
+  PriceSnapshot,
+  ReviewSummary,
+  StoreItemSummary,
+} from "./types";
 
 // ============================================================================
 // 옵션
@@ -73,6 +86,18 @@ export interface AnalyzeOptions {
    * 순수 분석 함수는 이 값을 쓰지 않는다 — 조회 대상 축소는 전적으로 라우트 책임.
    */
   fastMode: boolean;
+  /**
+   * 가성비 반영. true이면 위시리스트 트랙 블렌딩에 할인 매력도(dealScore)를 더한다
+   * (W_MATCH_V·match + W_REVIEW_V·review + W_DEAL·deal). 가격 조회가 실패하면 라우트가
+   * 기존 산식으로 fallback한다. 라이브러리 트랙에는 영향 없음(이미 보유).
+   * (작업 지시서 20261010_01 §1-2, §1-3)
+   */
+  valueWeighting: boolean;
+  /**
+   * 위시리스트 트랙을 할인 중(discount_percent > 0) 후보로 한정한다.
+   * 가격 미상 후보도 제외된다(할인 여부를 확인할 수 없으므로).
+   */
+  saleOnly: boolean;
 }
 
 /**
@@ -88,6 +113,8 @@ export const DEFAULT_ANALYZE_OPTIONS: AnalyzeOptions = {
   topNTaste: 6,
   maxRecommendationsPerTrack: 12,
   fastMode: false,
+  valueWeighting: true,
+  saleOnly: false,
 };
 
 /**
@@ -145,6 +172,11 @@ export interface WishlistAnalyzedGame {
   categoryLabels: Record<number, string>;
   isFree: boolean;
   headerImage?: string;
+  /** 가격 스냅샷. undefined = 미조회/미상, null = 확인된 무료/미판매. */
+  price?: SteamPriceOverview | null;
+  priceFetchedAt?: number;
+  /** 미출시 여부 (details.release_date.coming_soon). 가격 null의 흔한 원인이라 표시용으로 보존. */
+  comingSoon?: boolean;
 }
 
 // ============================================================================
@@ -218,7 +250,11 @@ export interface Recommendation {
    * - 블렌딩 후: W_MATCH·matchScore + W_REVIEW·reviewScore.
    */
   score: number;
-  source: "library-unplayed" | "wishlist";
+  /**
+   * 추천 트랙. "store-deal"은 미보유·위시리스트 밖 할인 게임 발굴 트랙
+   * (작업 지시서 20261010_01 단계 2). 구 캐시 row에는 나타나지 않는다(필드 추가만).
+   */
+  source: "library-unplayed" | "wishlist" | "store-deal";
   /** 라이브러리 미플레이 후보일 때만 */
   playtimeMinutes?: number;
   /** 위시리스트 후보일 때만 */
@@ -229,7 +265,27 @@ export interface Recommendation {
    * recommendFromWishlist와 동일하게 유지하기 위해 보존한다.
    */
   wishlistDateAdded?: number;
+  /**
+   * 가격 스냅샷 (위시리스트 트랙, 가격 조회 후에만). undefined = 미조회/미상,
+   * null = 확인된 무료/미판매. 금액은 1/100 단위 — 표시는 *_formatted 사용.
+   */
+  price?: SteamPriceOverview | null;
+  /** price를 가져온 시각 (Unix ms). 클라이언트의 묵은 가격 판단(PRICE_STALE_MS) 근거. */
+  priceFetchedAt?: number;
+  /** 할인 매력도 [0,1]. 가성비 블렌딩을 거친 결과에만 채워진다. */
+  dealScore?: number;
+  /** 미출시 게임 (위시리스트 트랙). 가격 대신 "출시 예정"을 표시한다. */
+  comingSoon?: boolean;
+  /** 진행 중인 할인 종료 시각 (Unix 초, store-deal 트랙). 카드의 "N일 후 종료" 표시용. */
+  discountEndsAt?: number;
 }
+
+/**
+ * 호평률 배지 저표본 기준. 이 미만이면 호평 %를 단정하지 않고 표본 수만 노출한다.
+ * store-deal 트랙은 이 미만(또는 리뷰 요약 없음) 후보를 아예 제외한다 (작업 지시서
+ * 20261010_01 M9). 클라이언트 배지와 서버 하한이 같은 값을 쓰도록 여기서 export.
+ */
+export const REVIEW_BADGE_MIN_SAMPLE = 10;
 
 // ============================================================================
 // 풀 분류
@@ -402,6 +458,61 @@ export const W_MATCH = 0.65;
 export const W_REVIEW = 0.35;
 
 /**
+ * 가성비 블렌딩 가중치 (작업 지시서 20261010_01 §1-2, 부록 A).
+ *   score = W_MATCH_V·matchScore + W_REVIEW_V·reviewScore + W_DEAL·dealScore   (합 = 1)
+ * 취향이 여전히 최대 비중 — "싸지만 취향 아님"이 상위를 차지하지 않도록.
+ */
+export const W_MATCH_V = 0.45;
+export const W_REVIEW_V = 0.30;
+export const W_DEAL = 0.25;
+
+/**
+ * 할인 매력도의 기본 비중. dealScore = d · (DEAL_BASE + (1 − DEAL_BASE)·cheap).
+ * 할인율 d가 주신호이고, 최종가가 저렴한 정도(cheap)는 최대 25%까지만 가산한다.
+ */
+export const DEAL_BASE = 0.75;
+/** cheap 산정 기준가 (원). 이 가격 이상이면 cheap = 0. */
+export const DEAL_PRICE_REF_KRW = 60000;
+
+/**
+ * 가격 금액(1/100 단위)을 원 단위로 정규화한다. KRW 외 통화는 null.
+ * Steam은 KRW도 1/100 단위로 준다 (단계 0 V5: ₩54,900 → 5490000).
+ */
+export function priceToWon(price: SteamPriceOverview, amount: number): number | null {
+  if (price.currency !== "KRW") return null;
+  if (!Number.isFinite(amount)) return null;
+  return amount / 100;
+}
+
+/**
+ * 할인 매력도 [0,1] (순수 함수, 작업 지시서 20261010_01 §1-2).
+ *
+ *   d         = clamp01(discount_percent / 100)        — 할인 없으면 0 → 결과 0
+ *   cheap     = 1 − min(finalWon, REF) / REF            — KRW가 아니거나 금액 이상이면 0
+ *   dealScore = d · (DEAL_BASE + (1 − DEAL_BASE)·cheap)
+ *
+ * 할인율을 곱 인자로 두어, 아주 싼 게임의 소폭 할인이 과대평가되지 않게 한다
+ * (₩1,000 10% ≈ 0.10 < ₩60,000 50% ≈ 0.44). 100% 할인(final 0)은 정확히 1.0.
+ * 가격 미상(undefined)·무료/미판매(null)·NaN은 0.
+ */
+export function computeDealScore(price: SteamPriceOverview | null | undefined): number {
+  if (!price) return 0;
+  const pct = price.discount_percent;
+  if (!Number.isFinite(pct) || pct <= 0) return 0;
+  const d = clamp01(pct / 100);
+  const finalWon = priceToWon(price, price.final);
+  const cheap = finalWon !== null && finalWon >= 0
+    ? 1 - Math.min(finalWon, DEAL_PRICE_REF_KRW) / DEAL_PRICE_REF_KRW
+    : 0;
+  return d * (DEAL_BASE + (1 - DEAL_BASE) * cheap);
+}
+
+/** 할인 중인지 (discount_percent > 0). 가격 미상/무료는 false. */
+export function isOnSale(price: SteamPriceOverview | null | undefined): boolean {
+  return !!price && price.discount_percent > 0;
+}
+
+/**
  * 프로필 벡터의 크기 ‖a‖.
  *
  * 벡터 정의 (작업 지시서 단계 1, Momus C-NEW 반영):
@@ -540,16 +651,25 @@ export function buildReviewBadge(summary: ReviewSummary | null): ReviewBadge | n
  * @param shortlist matchScore 기준 상위 후보 (recommend* 함수가 limit=shortlist 크기로 반환).
  * @param reviewScoreByAppid appid → computeReviewScore 결과.
  * @param limit 최종 반환 개수 (maxRecommendationsPerTrack).
+ * @param dealScoreByAppid 전달 시 가성비 산식(W_MATCH_V/W_REVIEW_V/W_DEAL)으로 블렌딩한다.
+ *   맵에 없는 후보(가격 미상)는 deal=0 — "할인 없음"과 같은 순위 패널티(문서화된 의도).
+ *   미전달이면 기존 산식을 그대로 탄다(가중치 재배열 없이 분기해 결과가 비트 단위로 동일).
  */
 export function blendRecommendations(
   shortlist: Recommendation[],
   reviewScoreByAppid: ReadonlyMap<number, number>,
-  limit: number
+  limit: number,
+  dealScoreByAppid?: ReadonlyMap<number, number>
 ): Recommendation[] {
   const blended = shortlist.map(r => {
     const reviewScore = reviewScoreByAppid.get(r.appid) ?? 0.5;
-    const score = W_MATCH * r.matchScore + W_REVIEW * reviewScore;
-    return { ...r, reviewScore, score };
+    if (!dealScoreByAppid) {
+      const score = W_MATCH * r.matchScore + W_REVIEW * reviewScore;
+      return { ...r, reviewScore, score };
+    }
+    const dealScore = dealScoreByAppid.get(r.appid) ?? 0;
+    const score = W_MATCH_V * r.matchScore + W_REVIEW_V * reviewScore + W_DEAL * dealScore;
+    return { ...r, reviewScore, dealScore, score };
   });
   // tiebreak 키(오름차순 비교): 각 항목을 "자신의" source 기준으로 환산한다.
   // 항목별로 자기 source로 키잉하므로 혼합 source 입력이 들어와도 오정렬되지 않는다.
@@ -557,6 +677,8 @@ export function blendRecommendations(
   //   - library-unplayed: playtime 내림차순 → -playtime.       (2차, 3차 없음)
   //   - wishlist:         priority 오름차순(낮을수록 갖고 싶음) → priority (2차),
   //                       그다음 dateAdded 내림차순(최근 추가 우선) → -dateAdded (3차).
+  //   - store-deal:       priority·dateAdded가 없어 2·3차가 모두 동률 → appid asc로 결정.
+  //                       (score·matchScore가 모두 같은 경우만 해당 — 부동소수 동률은 드묾)
   // recommendLibraryUnplayed/recommendFromWishlist의 원 정렬과 동일하게 맞춰,
   // partial(match-only)과 final(blended)의 동점 순서가 어긋나지 않도록 한다.
   const key2 = (r: Recommendation): number =>
@@ -655,9 +777,13 @@ export function recommendFromWishlist(
   const results: Recommendation[] = [];
   for (const g of wishlist) {
     if (opts.excludeFree && g.isFree) continue;
+    // saleOnly: 할인 중으로 확인된 후보만. 가격 미상도 제외(할인 여부를 모름).
+    if (opts.saleOnly && !isOnSale(g.price)) continue;
     const { matchScore, matchedGenres, matchedCategories } = scoreAgainstProfile(g, profile, profileNorm);
     if (matchScore <= 0) continue;
     results.push({
+      ...(g.price !== undefined ? { price: g.price, priceFetchedAt: g.priceFetchedAt } : {}),
+      ...(g.comingSoon ? { comingSoon: true } : {}),
       appid: g.appid,
       name: g.name,
       headerImage: g.headerImage,
@@ -686,6 +812,133 @@ export function recommendFromWishlist(
     return a.appid - b.appid;
   });
   return results.slice(0, limit);
+}
+
+/**
+ * 매칭 shortlist에 할인 후보를 보강한다 (순수 함수, 작업 지시서 20261010_01 §1-4 ④).
+ *
+ * shortlist는 matchScore 순이라, 할인 폭이 큰데 매칭 순위가 shortlist 밖인 게임은
+ * 가성비 블렌딩에 들어갈 기회가 없다. candidates(truncate 전 전체 매칭 목록) 중
+ * 할인 중인 후보를 dealScore desc → appid asc로 최대 k개 골라 shortlist 뒤에 덧붙인다
+ * (shortlist에 이미 있는 appid는 제외). candidates는 이미 매칭>0만 담고 있다.
+ */
+export function augmentWithDeals(
+  shortlist: Recommendation[],
+  candidates: Recommendation[],
+  k: number
+): Recommendation[] {
+  if (k <= 0) return shortlist;
+  const inShortlist = new Set(shortlist.map(r => r.appid));
+  const extras = candidates
+    .filter(r => !inShortlist.has(r.appid) && isOnSale(r.price))
+    .map(r => ({ r, deal: computeDealScore(r.price) }))
+    .sort((a, b) => (b.deal - a.deal) || (a.r.appid - b.r.appid))
+    .slice(0, k)
+    .map(x => x.r);
+  return extras.length > 0 ? [...shortlist, ...extras] : shortlist;
+}
+
+/**
+ * 위시리스트 트랙의 블렌딩 대상과 가성비 사용 여부를 정한다 (순수 함수, §1-4 ④⑤).
+ *
+ * - useDeal = valueWeighting && priceOk. 가격 조회가 실패(priceOk=false)하면 가성비를 끄고
+ *   기존 산식을 쓴다 — 가격 실패가 조용히 순위를 바꾸지 않도록.
+ * - useDeal이면 truncate 전 전체 매칭 목록(all)에서 할인 후보를 최대
+ *   maxRecommendationsPerTrack개 보강한다.
+ *
+ * 리뷰 요약 조회(I/O)는 targets로 라우트가 수행하고, 결과를 blendWishlistTrack에 넘긴다.
+ */
+export function planWishlistBlend(
+  shortlist: Recommendation[],
+  all: Recommendation[],
+  opts: AnalyzeOptions,
+  priceOk: boolean
+): { targets: Recommendation[]; useDeal: boolean } {
+  const useDeal = opts.valueWeighting && priceOk;
+  const targets = useDeal ? augmentWithDeals(shortlist, all, opts.maxRecommendationsPerTrack) : shortlist;
+  return { targets, useDeal };
+}
+
+/**
+ * planWishlistBlend 결과를 리뷰 점수와 블렌딩해 최종 위시 트랙을 만든다 (순수 함수).
+ * useDeal=false면 dealScoreByAppid를 넘기지 않아 기존 산식과 동일한 결과가 나온다.
+ */
+export function blendWishlistTrack(
+  targets: Recommendation[],
+  reviewScoreByAppid: ReadonlyMap<number, number>,
+  limit: number,
+  useDeal: boolean
+): Recommendation[] {
+  const dealScoreByAppid = useDeal
+    ? new Map<number, number>(targets.map(r => [r.appid, computeDealScore(r.price)]))
+    : undefined;
+  return blendRecommendations(targets, reviewScoreByAppid, limit, dealScoreByAppid);
+}
+
+/**
+ * store-deal 트랙 후보 (작업 지시서 20261010_01 단계 2-3).
+ * 장르·카테고리 라벨은 appdetails 메타, 가격·리뷰는 GetItems 요약에서 온다.
+ */
+export interface StoreDealCandidate {
+  appid: number;
+  name: string;
+  headerImage?: string;
+  isFree: boolean;
+  genreIds: string[];
+  categoryIds: number[];
+  genreLabels: Record<string, string>;
+  categoryLabels: Record<number, string>;
+  price: SteamPriceOverview | null;
+  priceFetchedAt: number;
+  discountEndsAt?: number;
+}
+
+/**
+ * 트랙 C: 미보유·위시리스트 밖 할인 게임 중 성향과 일치하는 것을 추천한다 (순수 함수).
+ *
+ * 처리:
+ *   - excludeFree면 무료 제외, 할인 중(discount_percent > 0)이 아니면 제외
+ *     (라우트의 선정 단계에서 이미 걸렀지만 순수 함수 단독 계약으로도 보장).
+ *   - 매칭 0 탈락 (기존 트랙과 동일 규칙).
+ *   - 정렬: matchScore desc → dealScore desc → appid asc. 상위 limit개(리뷰 블렌딩용 shortlist).
+ *
+ * 리뷰 하한(M9)과 블렌딩은 라우트가 GetItems 리뷰 요약으로 수행한다 — 이 함수는 매칭만.
+ */
+export function recommendStoreDeals(
+  candidates: StoreDealCandidate[],
+  profile: TasteProfile,
+  opts: AnalyzeOptions,
+  limit: number = opts.maxRecommendationsPerTrack
+): Recommendation[] {
+  const profileNorm = computeProfileNorm(profile);
+  const scored: { rec: Recommendation; deal: number }[] = [];
+  for (const g of candidates) {
+    if (opts.excludeFree && g.isFree) continue;
+    if (!isOnSale(g.price)) continue;
+    const { matchScore, matchedGenres, matchedCategories } = scoreAgainstProfile(g, profile, profileNorm);
+    if (matchScore <= 0) continue;
+    scored.push({
+      deal: computeDealScore(g.price),
+      rec: {
+        appid: g.appid,
+        name: g.name,
+        headerImage: g.headerImage,
+        isFree: g.isFree,
+        matchedGenres,
+        matchedCategories,
+        matchScore,
+        // 매칭 전용: score = matchScore. 블렌딩은 라우트가 blendRecommendations로 덮어쓴다.
+        score: matchScore,
+        source: "store-deal",
+        price: g.price,
+        priceFetchedAt: g.priceFetchedAt,
+        ...(g.discountEndsAt !== undefined ? { discountEndsAt: g.discountEndsAt } : {}),
+      },
+    });
+  }
+  scored.sort((a, b) =>
+    (b.rec.matchScore - a.rec.matchScore) || (b.deal - a.deal) || (a.rec.appid - b.rec.appid));
+  return scored.slice(0, limit).map(x => x.rec);
 }
 
 // ============================================================================
@@ -730,7 +983,13 @@ export function buildOwnedAnalyzedGame(
  */
 export function buildWishlistAnalyzedGame(
   item: SteamWishlistItem,
-  details: SteamAppDetails | null
+  details: SteamAppDetails | null,
+  /**
+   * 가격 스냅샷 (getAppPricesBatch). 미전달 = 가격 미조회/미상.
+   * details.price_overview는 캐시 경로에 따라 묵었거나 없으므로 쓰지 않는다
+   * (작업 지시서 20261010_01 "현재 상태").
+   */
+  priceSnapshot?: PriceSnapshot
 ): WishlistAnalyzedGame {
   const genres = details?.genres ?? [];
   const categories = details?.categories ?? [];
@@ -749,5 +1008,44 @@ export function buildWishlistAnalyzedGame(
     categoryLabels,
     isFree: details?.is_free ?? false,
     headerImage: details?.header_image,
+    ...(priceSnapshot ? { price: priceSnapshot.price, priceFetchedAt: priceSnapshot.fetchedAt } : {}),
+    ...(details?.release_date?.coming_soon ? { comingSoon: true } : {}),
+  };
+}
+
+/**
+ * appdetails 메타 + GetItems 요약 → StoreDealCandidate (store-deal 트랙).
+ *
+ * - 장르·카테고리와 그 라벨은 appdetails를 쓴다. GetItems는 장르가 없고 카테고리 라벨도
+ *   없기 때문(부록 B V2). 카테고리 id 체계는 둘이 같다.
+ * - 가격은 GetItems(신선, 1시간 캐시)를 쓴다. details.price_overview는 캐시 경로에 따라
+ *   묵었거나 없으므로 쓰지 않는다 (위시 트랙과 같은 원칙).
+ * - details가 null(메타 조회 실패)이면 null — 장르 없이는 매칭할 수 없다.
+ */
+export function buildStoreDealCandidate(
+  details: SteamAppDetails | null,
+  item: StoreItemSummary
+): StoreDealCandidate | null {
+  if (!details) return null;
+  const genres = details.genres ?? [];
+  const categories = details.categories ?? [];
+  const genreLabels: Record<string, string> = {};
+  const categoryLabels: Record<number, string> = {};
+  for (const g of genres) genreLabels[g.id] = g.description;
+  for (const c of categories) categoryLabels[c.id] = c.description;
+  return {
+    appid: item.appid,
+    name: details.name || `AppID ${item.appid}`,
+    headerImage: details.header_image,
+    // appdetails is_free(=F2P)만 쓴다. GetItems is_free는 100% 할인 배포(한정 무료)에도 true라
+    // 섞으면 excludeFree(F2P 노이즈 제거 목적)가 가장 좋은 할인을 걸러 버린다 (실응답 확인).
+    isFree: details.is_free,
+    genreIds: genres.map(g => g.id),
+    categoryIds: categories.map(c => c.id),
+    genreLabels,
+    categoryLabels,
+    price: item.price,
+    priceFetchedAt: item.fetchedAt,
+    ...(item.discountEndsAt !== undefined ? { discountEndsAt: item.discountEndsAt } : {}),
   };
 }

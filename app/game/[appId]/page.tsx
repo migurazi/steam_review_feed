@@ -9,6 +9,7 @@ import MediaPlayer from '@/components/MediaPlayer';
 import GamePrice from '@/components/GamePrice';
 import GameAchievementsSection from '@/components/GameAchievementsSection';
 import type { GameReviewsEvent, ProgressEvent as ProgressEventData, SteamReview, SteamMovie, SteamScreenshot, SteamPriceOverview } from '@/lib/steam/types';
+import { isPriceStale, formatPriceAge } from '@/lib/price-display';
 
 export default function GamePage({
   params,
@@ -37,6 +38,8 @@ export default function GamePage({
     price: SteamPriceOverview | null;
     comingSoon: boolean;
     releaseDate: string | null;
+    /** 가격을 확인한 시각 (Unix ms). 조회 장애 시 묵은 가격을 회색으로 구분하는 근거. */
+    priceFetchedAt?: number | null;
   } | null>(null);
 
   useEffect(() => {
@@ -119,6 +122,10 @@ export default function GamePage({
                 comingSoon={priceInfo.comingSoon}
                 releaseDate={priceInfo.releaseDate ?? undefined}
                 variant="full"
+                // 가격 조회 장애 시 서버가 마지막으로 확인한 가격을 원래 시각과 함께 준다.
+                // 1시간(PRICE_STALE_MS)을 넘었으면 회색 + "N시간 전 가격" (작업 지시서 20261010_02 §2-2).
+                stale={isPriceStale(priceInfo.priceFetchedAt)}
+                staleLabel={formatPriceAge(priceInfo.priceFetchedAt)}
               />
             )}
             <a
