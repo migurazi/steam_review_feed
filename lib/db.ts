@@ -99,6 +99,16 @@ export function getDb(): Database.Database {
       fetched_at INTEGER NOT NULL
     );
 
+    -- 성향 분석용 스토어 메타 (GetItems 기반, lib/steam/store-meta.ts).
+    -- app_details_cache와 분리한다 — 여기 details는 장르를 태그 id로 담은 축약본이라(동영상·
+    -- 스크린샷 없음) 게임 상세 화면이 읽으면 안 된다. details = null JSON은 "메타 없음"(삭제·지역
+    -- 제한 앱) negative row. TTL은 read 시점에 fetched_at으로 검사.
+    CREATE TABLE IF NOT EXISTS store_meta_cache (
+      app_id INTEGER PRIMARY KEY,
+      details TEXT NOT NULL,
+      fetched_at INTEGER NOT NULL
+    );
+
     -- ===== 도전과제 (작업 지시서 20260825_01) =====
     -- 기존 테이블 변경이 없으므로 마이그레이션 불필요 (CREATE TABLE IF NOT EXISTS).
 

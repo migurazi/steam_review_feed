@@ -2,7 +2,8 @@
  * 인메모리 TTL + LRU 캐시.
  *
  * lru-cache 패키지를 사용하여 TTL 만료 + LRU 교체를 지원한다.
- * 최대 10,000 엔트리를 유지하며, 초과 시 가장 오래 사용되지 않은 항목부터 제거.
+ * 일반 캐시는 최대 10,000 엔트리, 게임 단위 대량 캐시(gameCache)는 별도 인스턴스에 최대 60,000 엔트리.
+ * 초과 시 가장 오래 사용되지 않은 항목부터 제거.
  *
  * Steam API 장애 시 만료된 캐시를 stale 상태로 반환하는 기능 포함.
  * (lru-cache의 allowStale 옵션 + fetchedAt 타임스탬프)
@@ -27,6 +28,28 @@ const cache = new LRUCache<string, CacheValue<unknown>>({
   allowStale: true,
   // 기본 TTL은 set() 호출 시 개별 지정
 });
+
+/**
+ * 게임 단위로 대량 기록되는 키 전용 LRU (/code-review 5차 #5).
+ *
+ * 성향 분석은 GetItems 응답 하나로 게임마다 메타(storemeta)·리뷰 요약(reviewsummary)·가격(app:{id}:price)을
+ * 함께 기록한다(+ 발굴 후보는 storeitem). 미캐시 5,000개 라이브러리 한 번이면 1만 5천 항목 이상이라,
+ * 메인 LRU(10,000)에 넣으면 같은 분석이 뒤에서 다시 읽을 리뷰·가격이 먼저 밀려나 재조회되고, 다른 사용자의
+ * 위시리스트·라이브러리·리뷰 캐시도 모두 밀려난다. 이 키들은 작은 객체(수백 바이트~1KB)라 별도 인스턴스에
+ * 넉넉한 상한을 둔다(최악 수십 MB). 호출 측 API(cacheGet/cacheSet)는 같고 키 접두사로 자동 분기한다.
+ */
+const gameCache = new LRUCache<string, CacheValue<unknown>>({
+  max: 60_000,
+  allowStale: true,
+});
+
+/** gameCache로 보낼 키: 게임 단위 대량 캐시. */
+const GAME_KEY_RE = /^(?:storemeta:|reviewsummary:|storeitem:|app:\d+:price:)/;
+
+/** 키가 속한 LRU 인스턴스. */
+function lruFor(key: string): LRUCache<string, CacheValue<unknown>> {
+  return GAME_KEY_RE.test(key) ? gameCache : cache;
+}
 
 /**
  * 캐시 종류별 TTL (밀리초).
@@ -88,11 +111,12 @@ export function cacheGet<T>(key: string): {
   fetchedAt: number;
   isStale: boolean;
 } | null {
-  const entry = cache.get(key) as CacheValue<T> | undefined;
+  const lru = lruFor(key);
+  const entry = lru.get(key) as CacheValue<T> | undefined;
   if (!entry) return null;
 
   // lru-cache의 getRemainingTTL로 만료 여부 확인
-  const remainingTtl = cache.getRemainingTTL(key);
+  const remainingTtl = lru.getRemainingTTL(key);
   const isStale = remainingTtl <= 0;
 
   return {
@@ -110,7 +134,7 @@ export function cacheGet<T>(key: string): {
  * @param ttl TTL (밀리초). CACHE_TTL 상수 사용 권장.
  */
 export function cacheSet<T>(key: string, data: T, ttl: number): void {
-  cache.set(
+  lruFor(key).set(
     key,
     { data, fetchedAt: Date.now() } as CacheValue<unknown>,
     { ttl }
@@ -122,7 +146,7 @@ export function cacheSet<T>(key: string, data: T, ttl: number): void {
  * 수동 새로고침 시 사용.
  */
 export function cacheDelete(key: string): void {
-  cache.delete(key);
+  lruFor(key).delete(key);
 }
 
 /**
@@ -130,9 +154,11 @@ export function cacheDelete(key: string): void {
  * 예: cacheDeleteByPrefix("wishlist:76561198056932899")
  */
 export function cacheDeleteByPrefix(prefix: string): void {
-  for (const key of cache.keys()) {
-    if (key.startsWith(prefix)) {
-      cache.delete(key);
+  for (const lru of [cache, gameCache]) {
+    for (const key of lru.keys()) {
+      if (key.startsWith(prefix)) {
+        lru.delete(key);
+      }
     }
   }
 }
@@ -175,9 +201,11 @@ export function lastKnownPriceSet<P>(appId: number, snapshot: LastKnownPrice<P>)
 /**
  * 현재 캐시 통계 (디버깅/모니터링용).
  */
-export function cacheStats(): { size: number; max: number } {
+export function cacheStats(): { size: number; max: number; gameSize: number; gameMax: number } {
   return {
     size: cache.size,
     max: cache.max,
+    gameSize: gameCache.size,
+    gameMax: gameCache.max,
   };
 }

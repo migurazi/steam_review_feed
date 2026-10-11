@@ -160,6 +160,13 @@ export interface SteamStoreBrowseItem {
   success: number;
   name?: string;
   is_free?: boolean;
+  /** 사용자 태그 id (include_tag_count 요청 시, 상위 N개). */
+  tagids?: number[];
+  tags?: { tagid: number; weight?: number }[];
+  /** include_assets 요청 시. 이미지 URL = asset_url_format의 ${FILENAME}을 파일명으로 치환. */
+  assets?: { asset_url_format?: string; header?: string };
+  /** include_release 요청 시. */
+  release?: { steam_release_date?: number; is_coming_soon?: boolean; is_early_access?: boolean };
   categories?: {
     supported_player_categoryids?: number[];
     feature_categoryids?: number[];
@@ -183,6 +190,10 @@ export interface SteamStoreBrowseItem {
     active_discounts?: { discount_end_date?: number }[];
     hide_discount_pct_for_compliance?: boolean;
     price_cannot_be_displayed_as_discount?: boolean;
+    /** 이 옵션에 포함된 게임 수. 1보다 크면 묶음 패키지 (storeItemPriceIsAppPrice). */
+    included_game_count?: number;
+    /** 세트로만 구매 가능한 옵션. */
+    must_purchase_as_set?: boolean;
   };
 }
 

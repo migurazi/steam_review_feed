@@ -19,7 +19,11 @@
  *   progress        { phase: "fetching-prices", loaded, total }  (위시 트랙, 반복)
  *   progress        { phase: "analyzing",     loaded, total }    (1회)
  *   progress        { phase: "fetching-reviews", loaded, total } (반복)
- *   result          { profile, libraryUnplayed, wishlist }       (1회, 라이브러리·위시 확정)
+ *   result          { profile, libraryUnplayed, wishlist, pool, priceFetchFailed } (1회, 라이브러리·위시 확정)
+ *
+ * pool (partial-result·result·cached, 발굴은 store-deals의 pool/reviews): 재정렬 풀
+ *   (lib/recommend-rerank.ts). 가성비·할인만·개수는 서버 재요청 없이 클라이언트가 이 풀로 다시
+ *   계산한다. 그래서 결과 캐시 키에서도 그 세 옵션을 뺀다. 이벤트의 목록들은 요청 옵션 기준이다.
  *   --- tracks.deal일 때만 (발굴 단계, result 이후) ---
  *   progress        { phase: "discovering", loaded, total }        (할인 후보 수집)
  *   progress        { phase: "fetching-prices", loaded, total }    (후보 가격·리뷰 요약, GetItems)
@@ -59,20 +63,18 @@ import { getSession } from "@/lib/session";
 import {
   getOwnedGames,
   getWishlist,
-  getAppDetailsBatch,
-  getReviewSummary,
-  getAppPricesBatch,
+  getStoreMetaBatch,
+  getReviewSummariesBatch,
+  getStoreItemPricesBatch,
   getStoreSpecials,
   getStoreItemsBatch,
-  getCachedAppDetailsIds,
+  getCachedStoreMetaIds,
   peekReviewSummary,
-  getAppDetailsBackoffMs,
 } from "@/lib/steam/api";
 import { orderMetaFetch } from "@/lib/recommend-fetch-order";
 import { rateLimitResponse } from "@/lib/rate-limit";
 import { logEvent } from "@/lib/logger";
 import {
-  STREAM_CONCURRENCY,
   PRICE_STALE_MS,
   DISCOVER_POOL_SIZE,
   DISCOVER_META_CAP,
@@ -87,17 +89,16 @@ import {
   buildWishlistAnalyzedGame,
   validateAnalyzeOptions,
   computeReviewScore,
-  blendRecommendations,
   planWishlistBlend,
   blendWishlistTrack,
   buildReviewBadge,
   buildStoreDealCandidate,
   recommendStoreDeals,
-  computeDealScore,
   DEFAULT_ANALYZE_OPTIONS,
   REVIEW_BADGE_MIN_SAMPLE,
   type AnalyzeOptions,
   type TasteProfile,
+  type OwnedAnalyzedGame,
   type Recommendation,
   type StoreDealCandidate,
 } from "@/lib/steam/profile";
@@ -108,9 +109,27 @@ import {
   hashOptions,
 } from "@/lib/recommend-cache";
 import { sseEvent, sseResponse } from "@/lib/sse";
+import {
+  REVIEW_SHORTLIST_CAP,
+  shortlistSizeFor,
+  buildWishlistPool,
+  rerankFromPool,
+  poolAppIds,
+  shouldKeepPreviousWishlist,
+  withPreviousWishlist,
+  type RerankPool,
+} from "@/lib/recommend-rerank";
 
 /** partial-result emit 간격 (ms). 너무 짧으면 SSE 트래픽과 분석 CPU 낭비. */
 const PARTIAL_EMIT_INTERVAL_MS = 3000;
+
+/**
+ * partial-result에 재정렬 풀을 싣는 최소 간격 (ms). 풀은 목록보다 훨씬 크다(후보 최대 ~120개 + 리뷰).
+ * 3초마다 실으면 긴 분석에서 SSE 트래픽이 수 MB가 되므로, 바뀌었을 때만 + 이 간격 이상으로 보낸다.
+ * 조기 위시 확정 partial과 최종 result는 이 간격과 무관하게 항상 싣는다.
+ * 클라이언트는 풀이 없는 partial에서 이전 풀을 유지한다(잠정 결과라 최대 이 간격만큼 늦게 반영).
+ */
+const PARTIAL_POOL_EMIT_INTERVAL_MS = 30_000;
 
 /**
  * 시드 단계 게임 수.
@@ -126,21 +145,10 @@ const PARTIAL_EMIT_INTERVAL_MS = 3000;
 const PROFILE_SEED_COUNT = 20;
 
 /**
- * 리뷰 블렌딩 shortlist 크기 = min(maxRecommendationsPerTrack · MULTIPLIER, CAP).
- *
- * 리뷰 요약 조회는 per-후보 API 호출(500ms 직렬)이므로 전체 후보가 아니라 매칭 점수
- * 상위 shortlist에만 건다. MULTIPLIER=2로 최종 노출(maxPerTrack)보다 넉넉히 뽑아
- * 리뷰 블렌딩이 순위를 뒤집을 여지를 주되, CAP=30으로 트랙당 상한을 고정한다.
- * (트랙 2개 × 30 = 최대 60 fetch × 500ms ≈ 30초, 캐시 미스 전량 시. 작업 지시서 2-4)
- */
-const REVIEW_SHORTLIST_MULTIPLIER = 2;
-const REVIEW_SHORTLIST_CAP = 30;
-
-/**
  * 빠른 모드(fastMode) 조회 상한.
  *
- * 첫 분석의 지배적 비용은 미플레이 후보의 메타 조회(게임당 ~1.5초 직렬)다.
- * 빠른 모드는 이 둘을 상한하여 대형 라이브러리 첫 분석을 수십 분→몇 분으로 줄인다.
+ * 메타 조회는 GetItems 배치(100개/호출)라 대형 라이브러리도 수십 초면 끝나지만, 빠른 모드는 여전히
+ * 이 둘을 상한해 조회량과 분석 표본을 줄인다. (appdetails 직렬 시절에는 수십 분→몇 분 단축이 목적이었다.)
  *   - FAST_CANDIDATE_CAP: 미플레이 후보 수 상한. 후보는 playtime 내림차순으로
  *     정렬되어 있어 "조금이라도 켜본" 게임이 우선 포함된다(단순 무작위보다 나은 표본).
  *   - FAST_ANALYZED_CAP: 시드(PROFILE_SEED_COUNT) 외 analyzed-tier 조회 상한.
@@ -163,11 +171,28 @@ const PRICE_RETRY_MIN_MS = 5 * 60 * 1000;
 
 /**
  * phase B 동안 조기 확정 위시를 다시 블렌딩하는 간격과, 한 번에 새로 조회할 리뷰 요약 수 상한
- * (작업 지시서 20261010_02 §3-1). 리뷰 요약은 6시간 캐시라 대부분 캐시에서 오고, 미캐시분만
- * 상한만큼(0.5s × 5 ≈ 2.5초) 조회한다.
+ * (작업 지시서 20261010_02 §3-1). 리뷰 요약은 GetItems 배치(100개/호출)라 상한 안이면 호출 1회다.
+ * (이전에는 appreviews 개별 호출 0.5s × N이라 5개로 묶어 두었다.)
  */
 const EARLY_WISH_REFRESH_MS = 30_000;
-const EARLY_WISH_REVIEW_CAP = 5;
+const EARLY_WISH_REVIEW_CAP = 100;
+
+/**
+ * 재정렬 풀의 내용 식별자 (partial dedupe용). appid·할인율·리뷰 확보 수만 본다 — 클라이언트 재정렬
+ * 결과가 바뀔 수 있는 변화(후보 교체, 할인 변동, 새 리뷰 도착)를 잡기에 충분하다.
+ */
+function poolSignature(pool: RerankPool): string {
+  const ids = (recs: Recommendation[]) => recs.map(r => `${r.appid}:${r.price?.discount_percent ?? ""}`).join(",");
+  return `${ids(pool.library)}|${ids(pool.wishlist)}|${Object.keys(pool.reviews).length}|${pool.wishPricesReady ? 1 : 0}${pool.wishPriceOk ? 1 : 0}`;
+}
+
+/** 풀의 리뷰 중 recs에 해당하는 것만 꺼낸다 (이전 풀의 발굴 리뷰 이어 쓰기용). */
+function pickReviews(pool: RerankPool | undefined, recs: Recommendation[] | undefined): RerankPool["reviews"] {
+  const out: RerankPool["reviews"] = {};
+  if (!pool || !recs) return out;
+  for (const r of recs) if (r.appid in pool.reviews) out[r.appid] = pool.reviews[r.appid];
+  return out;
+}
 
 /** 요청 트랙. deal은 미보유 할인 게임 발굴(opt-in, 작업 지시서 20261010_01 단계 2). */
 interface Tracks { lib: boolean; wish: boolean; deal: boolean }
@@ -291,7 +316,7 @@ function computeRecommendations(
    */
   limit: number = options.maxRecommendationsPerTrack,
   /**
-   * 위시리스트 가격 스냅샷 (getAppPricesBatch). 미전달이면 가격 미조회 상태로 분석한다
+   * 위시리스트 가격 스냅샷 (getStoreItemPricesBatch). 미전달이면 가격 미조회 상태로 분석한다
    * (partial-result 경로). details.price_overview는 캐시 경로에 따라 묵었거나 없으므로
    * 가격은 반드시 이 맵으로만 주입한다 (작업 지시서 20261010_01 §1-1).
    */
@@ -302,54 +327,37 @@ function computeRecommendations(
    * (작업 지시서 20261010_02 §4). false면 wishlistAll은 빈 배열.
    */
   withWishlistAll = false,
+  /**
+   * 같은 detailsMap·같은 분석 옵션으로 이미 계산한 라이브러리 분석. 주면 다시 계산하지 않는다.
+   * 라이브러리 분석은 보유 게임 수천 개를 도는 가장 비싼 단계인데, 조기 위시 단계는 같은 메타로
+   * 세 번 계산했다(잠정 결과·위시 블렌딩·풀 재구성) (/code-review 5차 #10).
+   * 성향은 saleOnly·가성비·개수와 무관하므로(classify는 임계값·무료 제외만 본다) 그 옵션만 다른
+   * 호출끼리 공유해도 된다. 메타가 다른(진행 중에 채워지는) 맵에는 쓰면 안 된다.
+   */
+  ownedAnalysis?: OwnedAnalysis,
 ) {
-  const analyzedOwned = owned.map(g => buildOwnedAnalyzedGame(g, detailsMap.get(g.appid) ?? null));
-  const profile = analyzeTaste(analyzedOwned, options);
+  const analyzedOwned = ownedAnalysis?.analyzedOwned
+    ?? owned.map(g => buildOwnedAnalyzedGame(g, detailsMap.get(g.appid) ?? null));
+  const profile = ownedAnalysis?.profile ?? analyzeTaste(analyzedOwned, options);
+  const analysis: OwnedAnalysis = { analyzedOwned, profile };
   const libraryUnplayed = tracks.lib ? recommendLibraryUnplayed(analyzedOwned, profile, options, limit) : [];
-  if (!tracks.wish) return { profile, libraryUnplayed, wishlist: [], wishlistAll: [] };
+  if (!tracks.wish) return { profile, libraryUnplayed, wishlist: [], wishlistAll: [], analysis };
   const analyzedWishlist = wishlist.map(w =>
     buildWishlistAnalyzedGame(w, detailsMap.get(w.appid) ?? null, priceMap?.get(w.appid)),
   );
   if (!withWishlistAll) {
-    return { profile, libraryUnplayed, wishlist: recommendFromWishlist(analyzedWishlist, profile, options, limit), wishlistAll: [] };
+    return { profile, libraryUnplayed, wishlist: recommendFromWishlist(analyzedWishlist, profile, options, limit), wishlistAll: [], analysis };
   }
   // truncate 전 전체 매칭 목록 — 할인 후보 보강(augmentWithDeals)의 후보 풀.
   // 한 번만 정렬하고 slice로 shortlist를 얻는다 (recommendFromWishlist의 slice와 같은 결과).
   const wishlistAll = recommendFromWishlist(analyzedWishlist, profile, options, Number.MAX_SAFE_INTEGER);
-  return { profile, libraryUnplayed, wishlist: wishlistAll.slice(0, limit), wishlistAll };
+  return { profile, libraryUnplayed, wishlist: wishlistAll.slice(0, limit), wishlistAll, analysis };
 }
 
-/**
- * shortlist appid들의 리뷰 호평률 요약을 캐시 우선으로 직렬 조회한다.
- *
- * getAppDetailsBatch(`lib/steam/api.ts:517`)와 동일한 취소·배치 패턴:
- *   STREAM_CONCURRENCY 단위 배치, 매 배치 시작 전 isCancelled 검사.
- *   getReviewSummary 자체가 500ms 딜레이 + 캐시를 내장하므로 여기선 배치만 담당.
- *
- * @returns Map<appid, ReviewSummary | null>. null이면 조회 실패(호출 측이 중립 0.5로 흡수).
- */
-async function fetchReviewSummaries(
-  appIds: number[],
-  onProgress: (loaded: number, total: number) => void,
-  isCancelled: () => boolean,
-): Promise<Map<number, ReviewSummary | null>> {
-  const result = new Map<number, ReviewSummary | null>();
-  const total = appIds.length;
-  let loaded = 0;
-
-  for (let i = 0; i < appIds.length; i += STREAM_CONCURRENCY) {
-    if (isCancelled()) return result;
-    const batch = appIds.slice(i, i + STREAM_CONCURRENCY);
-    const settled = await Promise.allSettled(batch.map(id => getReviewSummary(id)));
-    for (let j = 0; j < batch.length; j++) {
-      const r = settled[j];
-      result.set(batch[j], r.status === "fulfilled" ? r.value : null);
-      loaded++;
-      onProgress(loaded, total);
-      if (isCancelled()) return result;
-    }
-  }
-  return result;
+/** 라이브러리 분석 결과 (computeRecommendations의 ownedAnalysis 참조). */
+interface OwnedAnalysis {
+  analyzedOwned: OwnedAnalyzedGame[];
+  profile: TasteProfile;
 }
 
 /**
@@ -364,7 +372,7 @@ async function fetchReviewSummaries(
  *    d. 위시리스트 — 라이브러리에 없는 ID
  *    각 bucket 내부는 playtime 내림차순(시드/c) 또는 playtime 내림차순(b) +
  *    appid 오름차순 동률 처리로 결정론 보장.
- * 3) getAppDetailsBatch (캐시 우선, 진행률 SSE) — 3초 throttle로 partial-result
+ * 3) getStoreMetaBatch (GetItems 100개/호출, 캐시 우선, 진행률 SSE) — 3초 throttle로 partial-result
  *    emit + 같은 throttle 구간에서 부분 결과를 recommendation_cache에 저장.
  *    사용자가 분석 도중 탭을 닫아도 다음 방문 시 그때까지 모은 결과를 즉시 본다.
  * 4) 라이브러리는 분석, 두 트랙 모두 추천 산출
@@ -392,6 +400,11 @@ async function runAnalysis(
   // 시키는 보장. cached payload의 sig로 seed하면 cached banner가 stuck됨.
   let lastEmittedSignature: string | null = null;
   let lastWrittenSignature: string | null = null;
+  // partial-result 풀 전송 throttle 상태 (PARTIAL_POOL_EMIT_INTERVAL_MS).
+  let lastPoolSentSig: string | null = null;
+  let lastPoolSentAt = 0;
+  // 메타 진행 중 partial 캐시 쓰기 시각 (makeMetaProgress 참조). 최종 결과는 force로 쓴다.
+  let lastPartialCacheWriteAt = 0;
 
   /**
    * 현재 결과의 signature 생성.
@@ -433,6 +446,9 @@ async function runAnalysis(
   // 이전 분석의 위시 결과. 위시 메타가 아직 다 오지 않은 동안의 partial 캐시 쓰기가 일부 위시만으로
   // 만든 목록으로 완전한 이전 결과를 덮지 않도록 대신 저장한다 (wishForCache).
   let carriedWishlist: Recommendation[] | undefined;
+  // 이전 분석의 재정렬 풀. 위시 풀은 carriedWishlist와, 발굴 풀(storeDeals)은 carriedStoreDeals와 같은
+  // 이유로 이어 쓴다. 구 캐시 row(풀 도입 전)에는 없다.
+  let carriedPool: RerankPool | undefined;
 
   // 0. 캐시 조회 — DB I/O가 빠르고 분석 시작 전 즉시 보여주기 위함.
   //    조회 실패는 silent (try/catch) — 캐시 모듈 자체 오류로 분석을 막지 않는다.
@@ -440,6 +456,7 @@ async function runAnalysis(
     const cached = getRecommendationCache(steamId, optionsHash);
     if (cached && tracks.deal) carriedStoreDeals = cached.payload.storeDeals;
     if (cached && tracks.wish) carriedWishlist = cached.payload.wishlist;
+    if (cached) carriedPool = cached.payload.pool;
     if (cached) {
       controller.enqueue(sseEvent("cached", {
         profile: cached.payload.profile,
@@ -450,6 +467,10 @@ async function runAnalysis(
         ownedGames: cached.payload.ownedGames,
         wishlistGames: cached.payload.wishlistGames,
         wishlistFetchFailed: cached.payload.wishlistFetchFailed,
+        // 재정렬 풀 + 위시 가격 실패 여부. 캐시 키가 재정렬 옵션(가성비·할인만·개수)을 빼고 만들어져
+        // 있어, 클라이언트는 풀로 현재 옵션의 목록을 다시 계산한다.
+        pool: cached.payload.pool,
+        priceFetchFailed: cached.payload.priceFetchFailed ?? false,
         computedAt: cached.computedAt,
       }));
     }
@@ -495,12 +516,21 @@ async function runAnalysis(
   if (carriedStoreDeals !== undefined) {
     const excluded = new Set([...owned.map(g => g.appid), ...wishlist.map(w => w.appid)]);
     const filtered = carriedStoreDeals.filter(r => !excluded.has(r.appid));
-    if (filtered.length !== carriedStoreDeals.length) {
+    // 발굴 풀도 같은 기준으로 거른다 — 클라이언트는 풀로 다시 계산하므로 목록만 거르면 구매한 게임이 남는다.
+    const poolDeals = carriedPool?.storeDeals;
+    const filteredPoolDeals = poolDeals?.filter(r => !excluded.has(r.appid));
+    if (filtered.length !== carriedStoreDeals.length || filteredPoolDeals?.length !== poolDeals?.length) {
       try {
-        controller.enqueue(sseEvent("cached-store-deals", { storeDeals: filtered }));
+        controller.enqueue(sseEvent("cached-store-deals", { storeDeals: filtered, poolStoreDeals: filteredPoolDeals }));
       } catch { /* closed */ }
     }
     carriedStoreDeals = wishlistFetchFailed ? undefined : filtered;
+    if (carriedPool) {
+      carriedPool = { ...carriedPool, storeDeals: wishlistFetchFailed ? undefined : filteredPoolDeals };
+    }
+  } else if (carriedPool?.storeDeals !== undefined && !tracks.deal) {
+    // 발굴을 요청하지 않은 분석이면 이전 발굴 풀도 이어 쓰지 않는다 (carriedStoreDeals와 같은 규칙).
+    carriedPool = { ...carriedPool, storeDeals: undefined };
   }
 
   /**
@@ -526,33 +556,52 @@ async function runAnalysis(
    *     의 sig가 우연히 일치해도 final write는 반드시 수행하여 cache row의
    *     computed_at이 분석 완료 시각으로 갱신되도록. 그렇지 않으면 다음 방문 시
    *     cached banner에 표시되는 "N분 전"이 실제 완료 시각보다 빠르게 표시.
+   *
+   * @returns 이 payload가 캐시에 반영된 상태인지 (방금 썼거나 같은 내용이 이미 저장됨). 가드로
+   *   건너뛰었거나 쓰기가 실패하면 false — partial 쓰기 throttle이 시각을 갱신하지 않고 다음 틱에 다시 시도한다.
    */
   function tryWriteCache(
     profile: TasteProfile,
     libraryUnplayed: Recommendation[],
     wishlistRecs: Recommendation[],
+    /**
+     * 재정렬 풀. storeDeals 필드는 이 함수가 storeDealsArg 규칙으로 채운다(호출 측 값은 무시).
+     * 발굴 풀을 줄 때는 storeDealsArg.pool로 넘긴다.
+     */
+    poolArg: RerankPool,
     force = false,
     /**
      * 발굴 트랙 결과.
-     *   - 배열: 그 결과를 저장.
-     *   - 생략(undefined): 이전 분석의 발굴 결과(carriedStoreDeals)를 이어 쓰고, 없으면 넣지 않는다.
+     *   - { list, pool }: 그 결과(최종 목록 + 재정렬용 shortlist)를 저장.
+     *   - 생략(undefined): 이전 분석의 발굴 결과(carriedStoreDeals·carriedPool.storeDeals)를 이어 쓰고,
+     *     없으면 넣지 않는다.
      *   - null: 이어 쓰지 않고 payload에서 뺀다 (이번 발굴이 저장할 수 없는 결과일 때).
      */
-    storeDealsArg?: Recommendation[] | null,
-  ): void {
-    const storeDeals = storeDealsArg === null ? undefined : (storeDealsArg ?? carriedStoreDeals);
-    if (isCancelled()) return;
+    storeDealsArg?: { list: Recommendation[]; pool: Recommendation[]; reviews: RerankPool["reviews"] } | null,
+  ): boolean {
+    const storeDeals = storeDealsArg === null ? undefined : (storeDealsArg?.list ?? carriedStoreDeals);
+    const poolStoreDeals = storeDealsArg === null ? undefined : (storeDealsArg?.pool ?? carriedPool?.storeDeals);
+    const pool: RerankPool = {
+      ...poolArg,
+      storeDeals: poolStoreDeals,
+      // 발굴 풀의 리뷰(GetItems 요약)도 함께 둔다. 이어 쓰는 경우는 이전 풀에서 가져온다.
+      reviews: {
+        ...(storeDealsArg ? storeDealsArg.reviews : storeDealsArg === undefined ? pickReviews(carriedPool, poolStoreDeals) : {}),
+        ...poolArg.reviews,
+      },
+    };
+    if (isCancelled()) return false;
     // 위시리스트 트랙이 켜져 있을 때만 위시리스트 장애로 캐시를 막는다.
-    if (tracks.wish && wishlistFetchFailed) return;
-    if (profile.analyzedGames === 0) return;
-    if (profile.genres.length === 0 && profile.categories.length === 0) return;
+    if (tracks.wish && wishlistFetchFailed) return false;
+    if (profile.analyzedGames === 0) return false;
+    if (profile.genres.length === 0 && profile.categories.length === 0) return false;
 
     // dedupe signature — 사용자에게 보여지는 cached payload의 모양이 바뀌었는지만
     // 빠르게 비교한다. profile/추천이 정밀하게 바뀐 경우(weight 미세 변화)는
     // 의도적으로 무시 — 그 수준의 차이는 cache hit으로 보여줘도 같은 결과처럼
     // 보이고, 저장 노이즈만 늘림.
-    const sig = computeResultSignature(profile, libraryUnplayed, wishlistRecs, storeDeals);
-    if (!force && sig === lastWrittenSignature) return;
+    const sig = `${computeResultSignature(profile, libraryUnplayed, wishlistRecs, storeDeals)}#${poolSignature(pool)}`;
+    if (!force && sig === lastWrittenSignature) return true;
 
     try {
       setRecommendationCache(steamId, optionsHash, {
@@ -566,10 +615,18 @@ async function runAnalysis(
         // (cached 수신 시 클라이언트가 위시리스트 실패 배너를 잘못 띄우지 않도록).
         wishlistFetchFailed: tracks.wish && wishlistFetchFailed,
         ...(storeDeals !== undefined ? { storeDeals } : {}),
+        pool,
+        // 캐시는 재정렬 옵션과 무관한 키라, 위시 가격 실패를 함께 저장해 두어야 다음 방문의 cached
+        // 결과에서 클라이언트가 (할인만 켬일 때) "할인 게임 없음" 대신 가격 실패 안내를 띄운다.
+        // 저장하는 풀에서 계산한다 — poolForCache가 이전 분석의 위시 풀을 이어 쓸 수 있어, 이번 실행의
+        // priceFetchFailed 값과 풀이 어긋나면 다음 방문에 "할인 게임 없음"이 잘못 보인다 (/code-review M2).
+        priceFetchFailed: tracks.wish && pool.wishPricesReady && !pool.wishPriceOk,
       });
       lastWrittenSignature = sig;
+      return true;
     } catch (err) {
       console.warn("[recommend] cache write failed:", err);
+      return false;
     }
   }
 
@@ -589,7 +646,7 @@ async function runAnalysis(
   // 카드팜 구간(unplayedMax < pt < cardFarmingMax)은 조회 목록에서 **제외**한다.
   // 이 구간 게임은 classify가 playtime만으로 'card-farming'으로 판정해 분석·추천
   // 양쪽에서 배제하므로 메타(장르/카테고리)가 전혀 필요 없다. 첫 분석의 메타 조회
-  // (게임당 ~1.5초 직렬)를 줄이는 무료·안전 최적화 — 추천 결과는 불변이다.
+  // 양을 줄이는 무료·안전 최적화 — 추천 결과는 불변이다.
   //   주의: excludeFree=true + 무료인 카드팜 게임은 메타 없이는 isFree를 몰라
   //   excludedFree 대신 cardFarmingExcluded로 집계된다(둘 다 '제외'라 추천엔 무영향,
   //   진단 카운트만 미세 이동). 이 희귀 교집합의 정확도를 위해 수천 건을 더 조회할
@@ -617,18 +674,23 @@ async function runAnalysis(
   //   phase A: 시드 + 영속 캐시에 메타가 있는 후보·위시·나머지 라이브러리 (딜레이 없이 수 초).
   //            끝나면 위시 트랙을 가격·리뷰까지 반영해 조기 확정하고, 라이브러리 트랙도 캐시된
   //            후보만으로 바로 보인다.
-  //   phase B: 미캐시분 (1.5s 직렬) — 후보 먼저, 그다음 나머지 라이브러리와 위시를 번갈아.
+  //   phase B: 미캐시분 (GetItems 100개/호출) — 후보 먼저, 그다음 나머지 라이브러리와 위시를 번갈아.
   //   이전 순서(시드 + 위시 전체 → 후보)는 위시리스트가 수천 개면 위시 메타 조회에 1시간 넘게
   //   걸려 라이브러리 트랙이 그동안 비었다.
   //   위시 메타에는 이미 소유한 위시 게임도 포함한다 — 위시 트랙은 소유 여부와 무관하게 전체가
   //   후보이고, 카드팜 구간이면 라이브러리 버킷에서도 메타를 받지 못하기 때문.
   //   위시 트랙이 꺼진 요청(tracks.wish=false)은 위시 메타를 조회하지 않는다.
+  const seedIds = seed.map(g => g.appid);
+  const candidateIds = candidates.map(g => g.appid);
+  const wishlistMetaIds = tracks.wish ? wishlist.map(w => w.appid) : [];
+  const restIds = analyzedRest.map(g => g.appid);
   const { phaseA: phaseAIds, phaseB: phaseBIds } = orderMetaFetch({
-    seedIds: seed.map(g => g.appid),
-    candidateIds: candidates.map(g => g.appid),
-    wishlistIds: tracks.wish ? wishlist.map(w => w.appid) : [],
-    restIds: analyzedRest.map(g => g.appid),
-    cachedIds: getCachedAppDetailsIds(),
+    seedIds,
+    candidateIds,
+    wishlistIds: wishlistMetaIds,
+    restIds,
+    // 공유 캐시 테이블 전체가 아니라 이번 분석이 조회할 appid만 확인한다 (/code-review 3차 #8).
+    cachedIds: getCachedStoreMetaIds([...seedIds, ...candidateIds, ...wishlistMetaIds, ...restIds]),
   });
   const total = phaseAIds.length + phaseBIds.length;
   if (cardFarmingSkipped > 0) {
@@ -660,8 +722,19 @@ async function runAnalysis(
   // 위시 가격 상태. 조기 위시 단계(phase A 직후)에서 채우고 최종 단계에서 재사용한다.
   let priceMap: Map<number, PriceSnapshot> | undefined;
   let priceFetchFailed = false;
-  /** 마지막 위시 가격 조회 완료 시각 (Unix ms). 최종 단계 재조회 판단용 (R1). */
+  /**
+   * 위시 가격 스냅샷의 기준 시각 (Unix ms) — 첫 조회 또는 마지막 전체 재조회 시각. 최종 단계
+   * 재조회 판단용 (R1). 0이면 아직 조회 전.
+   */
   let wishlistPricesFetchedAt = 0;
+  /** 이번 실행에서 가격 조회를 시도한 위시 appid. 증분 조회가 같은 실패를 반복하지 않게 한다. */
+  const priceAttemptedIds = new Set<number>();
+  /**
+   * 이번 실행에서 확보한 리뷰 요약 (appid → 요약, null = 조회 실패). 재정렬 풀(pool.reviews)의
+   * 출처다 — 클라이언트가 가성비·할인만·개수를 바꿔 재정렬할 때 서버 재요청 없이 쓸 수 있도록
+   * 조회한 것은 모두 모아 둔다. 풀에 넣을 때는 6시간 캐시(peekReviewSummary)도 함께 본다.
+   */
+  const reviewMap = new Map<number, ReviewSummary | null>();
   // 조기 확정된 위시 트랙(가격·리뷰 반영). 설정되면 phase B의 partial-result는 매칭 전용
   // 위시 목록 대신 이것을 보낸다 — 가격·배지가 있는 목록이 매칭 전용으로 뒤집히지 않도록.
   // phase B 동안 EARLY_WISH_REFRESH_MS마다 그때까지 도착한 메타·성향으로 다시 블렌딩한다
@@ -688,6 +761,51 @@ async function runAnalysis(
     carriedWishlist !== undefined && !wishMetaComplete(m) ? carriedWishlist : current;
 
   /**
+   * 지금까지 받은 메타로 재정렬 풀을 만든다 (lib/recommend-rerank.ts). partial·result 공용.
+   *
+   *   - 라이브러리: 매칭 상위 REVIEW_SHORTLIST_CAP.
+   *   - 위시: saleOnly=false로 계산한 전체 매칭 목록에서 buildWishlistPool 합집합. 요청이 saleOnly여도
+   *     풀은 할인 여부와 무관하게 만든다 — 클라이언트가 saleOnly를 끄면 그대로 쓸 수 있어야 한다.
+   *   - 리뷰: 이번 실행에서 받은 것(reviewMap) + 6시간 캐시(peek). 네트워크 호출 없음.
+   *
+   * @returns 풀과 그 계산에 쓴 성향 프로필.
+   */
+  function buildPool(
+    map: ReadonlyMap<number, SteamAppDetails | null>,
+    ownedAnalysis?: OwnedAnalysis,
+  ): { pool: RerankPool; profile: TasteProfile; analysis: OwnedAnalysis } {
+    const computed = computeRecommendations(
+      ownedForAnalysis, wishlist, map, tracks, { ...options, saleOnly: false }, REVIEW_SHORTLIST_CAP, priceMap, true,
+      ownedAnalysis,
+    );
+    const pool: RerankPool = {
+      library: computed.libraryUnplayed,
+      wishlist: buildWishlistPool(computed.wishlistAll),
+      reviews: {},
+      wishPricesReady: priceMap !== undefined,
+      wishPriceOk: priceMap !== undefined && !priceFetchFailed,
+    };
+    for (const id of poolAppIds(pool)) {
+      const s = reviewMap.has(id) ? reviewMap.get(id)! : peekReviewSummary(id);
+      if (s !== undefined) pool.reviews[id] = s;
+    }
+    return { pool, profile: computed.profile, analysis: computed.analysis };
+  }
+
+  /**
+   * partial 캐시 쓰기에 넣을 풀. wishForCache와 같은 이유로, 위시 메타가 덜 왔으면 이전 분석의 위시
+   * 풀(가격·리뷰 포함)을 유지한다.
+   */
+  const poolForCache = (current: RerankPool, m: ReadonlyMap<number, unknown>): RerankPool => {
+    // 이전 풀을 유지하는 경우: (1) 위시 메타가 덜 왔을 때(일부 위시만으로 만든 풀), (2) 이번 풀이 가격
+    // 조회 전인데 이전 풀은 가격이 있을 때 — 캐시 키가 할인만 여부와 무관해져, 가격 없는 풀이 저장되면
+    // 다음 방문의 할인만 화면이 "가격 확인 중"에 머문다 (/code-review M1). 클라이언트 mergePartialPool과 같은 규칙.
+    if (carriedPool === undefined) return current;
+    const keepCarried = !wishMetaComplete(m) || shouldKeepPreviousWishlist(current, carriedPool);
+    return keepCarried ? withPreviousWishlist(current, carriedPool) : current;
+  };
+
+  /**
    * 메타 배치 진행 콜백 생성. phase A/B가 하나의 진행률(total)을 공유하도록 offset을 더한다.
    * 3초 throttle로 잠정 추천(partial-result)을 보내고 캐시에 영속화한다.
    */
@@ -696,17 +814,16 @@ async function runAnalysis(
     baseMap: ReadonlyMap<number, SteamAppDetails | null>,
   ) => (loaded: number, _t: number, partial: ReadonlyMap<number, SteamAppDetails | null>) => {
       const overall = offset + loaded;
-      // 매 게임마다 progress 보내면 SSE 트래픽이 많음. 5게임마다 또는 마지막에만 전송.
-      if (overall % 5 === 0 || overall === total) {
+      // 진행률은 캐시분 처리 후와 GetItems 배치(100개)마다 한 번씩 온다 — 호출 수가 적어 매번 보낸다.
+      {
         try {
           controller.enqueue(sseEvent("progress", { phase: "fetching-meta", loaded: overall, total }));
         } catch { /* closed */ }
       }
       // 위시 주기 재블렌딩 (§3-1). 메타 콜백은 동기라 기다리지 않고 백그라운드로 돌리고,
       // 끝나면 earlyWishlist만 교체한다 — 다음 partial이 새 목록을 보낸다(signature에 appid 포함).
-      //   - 진행 중 Map은 getAppDetailsBatch가 계속 채우므로 시점 스냅샷을 복사해 넘긴다.
-      //   - 리뷰 요약은 캐시분 + 미캐시 최대 EARLY_WISH_REVIEW_CAP개만 조회. appreviews는 store
-      //     backoff를 공유하지 않는 별도 엔드포인트라 phase B 메타 조회와 겹쳐도 한도에 영향이 없다.
+      //   - 진행 중 Map은 getStoreMetaBatch가 계속 채우므로 시점 스냅샷을 복사해 넘긴다.
+      //   - 리뷰 요약은 캐시분 + 미캐시 최대 EARLY_WISH_REVIEW_CAP개만 GetItems 배치로 조회.
       //   - phase B가 끝난 뒤 늦게 끝난 재블렌딩은 버린다(최종 단계가 전체로 다시 계산).
       if (
         earlyWishlist !== null && phaseBActive && wishRefreshInFlight === null
@@ -730,89 +847,154 @@ async function runAnalysis(
         lastPartialEmitAt = now;
         // phase B에서는 phase A 결과(baseMap)와 진행 중 결과(partial)를 합쳐 분석한다.
         const merged = baseMap.size > 0 ? new Map([...baseMap, ...partial]) : partial;
-        // 조기 위시가 확정됐으면 위시 매칭은 버려지므로 계산하지 않는다.
-        const partialTracks = earlyWishlist !== null ? { lib: tracks.lib, wish: false } : tracks;
-        const computed = computeRecommendations(ownedForAnalysis, wishlist, merged, partialTracks, options);
-        const { profile, libraryUnplayed } = computed;
+        // 재정렬 풀을 만들고 요청 옵션의 목록은 풀에서 계산한다 (클라이언트와 같은 규칙).
+        // 클라이언트는 풀로 현재 옵션의 목록을 다시 계산하므로, 아래 목록은 signature·캐시용이다.
+        const { pool, profile } = buildPool(merged);
+        const lists = rerankFromPool(pool, options);
+        const libraryUnplayed = lists.libraryUnplayed;
         // 위시 트랙: 조기 확정분이 있으면 그것. 없고 saleOnly면 가격 확인 전이라 확정할 수
-        // 없으므로 null로 보내 클라이언트가 이전 위시 state를 유지하게 한다(깜빡임 방지,
-        // 작업 지시서 20261010_01 §1-4 partial-result).
-        // null은 위시 트랙이 켜져 있을 때만 의미가 있다 — 꺼진 요청(tracks=lib 등)에서 null을 보내면
-        // partial 캐시 쓰기가 전부 생략된다 (/code-review 2차 R5). 꺼졌으면 computed.wishlist = [].
+        // 없으므로 null(rerankFromPool)로 보내 클라이언트가 이전 위시 state를 유지하게 한다
+        // (깜빡임 방지, 작업 지시서 20261010_01 §1-4 partial-result).
+        // 위시 트랙이 꺼진 요청은 풀의 위시가 비어 있어 []가 된다 — null이면 partial 캐시 쓰기가
+        // 전부 생략되므로 (/code-review 2차 R5).
         const wishlistRecs: Recommendation[] | null =
-          earlyWishlist ?? (options.saleOnly && tracks.wish ? null : computed.wishlist);
+          earlyWishlist ?? (tracks.wish ? lists.wishlist : []);
         // 동일 signature dedup — 후반부 메타 누락 게임이 연속 fetch되어
         // 결과 모양이 같은 시점이 흔하다. 같은 sig가 또 오면 SSE/cache 양쪽
         // skip하여 (1) 네트워크 트래픽 (2) 클라이언트 React re-render
         // (3) SQLite write를 모두 절약. throttle timer는 그대로 갱신해 다음
         // 비교 시점을 정상화.
+        // sig는 요청 옵션 목록의 모양만 본다. 풀 변화는 poolPending(30초 간격)이 따로 판단한다 —
+        // 풀 signature를 sig에 넣으면 리뷰 수만 바뀌어도 매 틱(3초) 같은 목록을 다시 보내게 된다
+        // (/code-review 5차 #8). 클라이언트는 풀이 오는 시점에 재정렬 결과를 갱신한다.
+        const poolSig = poolSignature(pool);
         const sig = computeResultSignature(profile, libraryUnplayed, wishlistRecs);
-        if (sig === lastEmittedSignature) {
-          // skip SSE emit + cache write. tryWriteCache도 자체 lastWrittenSignature
-          // 가드로 막히지만 명시적으로 skip하여 의도 명확화.
+        // 풀이 아직 못 보낸 변경을 담고 있고 전송 간격이 지났으면, 모양이 같아도 건너뛰지 않는다 —
+        // 그렇지 않으면 간격 안에서 바뀐 풀이 result까지 묶인다 (/code-review M3).
+        const poolPending = poolSig !== lastPoolSentSig && now - lastPoolSentAt >= PARTIAL_POOL_EMIT_INTERVAL_MS;
+        // 중간 부분 결과를 DB에 영속화 — 사용자가 분석 도중에 탭을 닫아도 다음 방문 시 cached event로
+        // 여기까지 모은 결과가 즉시 표시된다. 가드/dedupe 정책은 tryWriteCache가 통합 관리.
+        //   - 쓰기 간격은 PARTIAL_POOL_EMIT_INTERVAL_MS(30초) — 3초마다 풀(후보 ~120개)을 SQLite에 다시 쓰지
+        //     않도록 (/code-review 4차 #7). 탭을 닫아도 최대 30초 전 결과까지는 남는다.
+        //   - 아래 SSE dedup(return)보다 먼저 판단한다. 그렇지 않으면 throttle에 걸려 못 쓴 상태가 이후
+        //     같은 signature로 계속 dedup되어 끝까지 저장되지 않는다(최종 쓰기 전에 탭을 닫으면 유실).
+        //     tryWriteCache가 자체 signature로 같은 내용 재기록을 막으므로 반복 호출 비용은 비교 1회다.
+        //   - 가드로 건너뛴 경우(분석 게임 0 등)는 시각을 갱신하지 않아 다음 틱에 바로 다시 시도한다.
+        //   - saleOnly partial은 위시 트랙이 미확정(null)이면 저장하지 않는다. 위시 메타가 덜 왔으면 이전
+        //     완전한 위시 결과를 유지(wishForCache·poolForCache).
+        if (wishlistRecs !== null && now - lastPartialCacheWriteAt >= PARTIAL_POOL_EMIT_INTERVAL_MS) {
+          if (tryWriteCache(profile, libraryUnplayed, wishForCache(wishlistRecs, merged), poolForCache(pool, merged))) {
+            lastPartialCacheWriteAt = now;
+          }
+        }
+        if (sig === lastEmittedSignature && !poolPending) {
+          // skip SSE emit (캐시 쓰기는 위에서 이미 판단).
           return;
         }
         lastEmittedSignature = sig;
+        // 풀은 바뀌었고 마지막 전송 후 간격이 지났을 때만 싣는다 (트래픽).
+        const sendPool = poolPending;
+        if (sendPool) {
+          lastPoolSentSig = poolSig;
+          lastPoolSentAt = now;
+        }
         try {
           controller.enqueue(sseEvent("partial-result", {
             profile,
             libraryUnplayed,
             wishlist: wishlistRecs,
+            ...(sendPool ? { pool } : {}),
             loaded: overall,
             total,
           }));
         } catch { /* closed */ }
-        // 중간 부분 결과를 DB에 영속화 — 사용자가 분석 도중에 탭을 닫아도
-        // 다음 방문 시 cached event로 여기까지 모은 결과가 즉시 표시된다.
-        // 가드/dedupe 정책은 tryWriteCache가 통합 관리.
-        // saleOnly partial은 위시 트랙이 미확정(null)이면 저장하지 않는다. 조기 위시가
-        // 확정된 뒤에는 저장된다. 위시 메타가 덜 왔으면 이전 완전한 위시 결과를 유지(wishForCache).
-        if (wishlistRecs !== null) tryWriteCache(profile, libraryUnplayed, wishForCache(wishlistRecs, merged));
       }
     };
 
   /**
    * 위시리스트 가격 (작업 지시서 20261010_01 §1-4, 1-A 흐름).
-   *   - saleOnly는 shortlist 이전에 걸러야 결과 수가 보장되므로 위시리스트 전체를 조회한다.
-   *     가격 배치(100개/호출) + 1시간 캐시라 위시 300개 ≈ 3회 호출.
-   *   - 소유한 위시 게임도 포함 — 위시 트랙은 소유 여부와 무관하게 전체를 후보로 본다.
-   *   - 커버리지가 FETCH_COVERAGE_MIN 미만이면 가격 조회 실패로 보고, 가성비 블렌딩을
-   *     끄고 기존 산식으로 fallback한다 (가격 실패가 조용히 순위를 바꾸지 않도록).
+   *
+   * 조회 범위 (/code-review 3차 #5): 메타가 있는 위시 게임 전체. saleOnly는 shortlist 이전에 걸러야
+   *   결과 수가 보장되고, 가성비는 shortlist 밖 할인 후보를 보강하기 때문이다. 요청이 둘 다 꺼져
+   *   있어도 전체를 조회한다 — 클라이언트가 서버 재요청 없이 가성비·할인만을 켤 수 있도록 재정렬
+   *   풀(lib/recommend-rerank.ts)에 가격이 있어야 하기 때문이다. (3차 #6의 "노출 카드만 조회" 최적화는
+   *   이 기능과 양립할 수 없어 되돌렸다.)
+   *   메타가 없는 위시 게임은 매칭 점수 0이라 어떤 순위에도 들지 않으므로 제외한다 — 그래서 조기
+   *   단계는 phase A(캐시) 메타분만 조회하고, 나머지는 메타가 도착한 뒤(주기 재블렌딩·최종 단계)에
+   *   조회한다. 이전 구현은 조기 단계에서 위시리스트 전체(수천 개면 1분+)를 조회해 그동안 미캐시
+   *   라이브러리 후보의 메타 조회(phase B)가 시작되지 못했다.
+   *
+   * 증분 조회: 이미 시도한 appid는 다시 조회하지 않는다(priceAttemptedIds). refresh=true면 시도
+   * 여부와 무관하게 coverageIds 전체를 다시 조회한다 — getStoreItemPricesBatch가 fresh 캐시(1h)는 호출 없이
+   * 돌려주므로 실제 호출은 만료·실패분만큼이다.
+   *
+   * 조회 경로: GetItems(api.steampowered.com, 100개/호출, 호출 사이 0.5초). 이전에는 appdetails 가격
+   * 배치(store 호스트, 100개마다 1.5초 + 공유 429 backoff)라 위시리스트 수천 개면 수십 초가 걸렸고,
+   * 발굴 단계의 store 호출과 한도를 나눠 썼다. 같은 응답으로 위시 게임의 리뷰 요약도 캐시에 채워져
+   * 블렌딩 단계의 리뷰 조회가 대부분 캐시에서 끝난다.
+   *
+   * 커버리지가 FETCH_COVERAGE_MIN 미만이면 가격 조회 실패로 보고, 가성비 블렌딩을 끄고 기존 산식으로
+   * fallback한다 (가격 실패가 조용히 순위를 바꾸지 않도록). 커버리지는 coverageIds 기준이다.
+   *
+   * @param coverageIds 이번 판단에 필요한 위시 appid (중복 허용).
+   * @param opts.refresh 이미 시도한 appid도 다시 조회 (가격 만료·실패 재시도).
+   * @param opts.progress fetching-prices 진행률을 보낼지. 주기 재블렌딩처럼 메타 진행률과 겹치는
+   *   백그라운드 호출은 false.
    */
-  async function fetchWishlistPrices(): Promise<void> {
-    const wishlistPriceIds = Array.from(new Set(wishlist.map(w => w.appid)));
-    if (!tracks.wish || wishlistPriceIds.length === 0) return;
-    try {
-      controller.enqueue(sseEvent("progress", { phase: "fetching-prices", loaded: 0, total: wishlistPriceIds.length }));
-    } catch { /* closed — 탭 닫힘. isCancelled 경로로 조용히 끝나게 한다 (R4) */ }
-    priceMap = await getAppPricesBatch(
-      wishlistPriceIds,
-      (loaded, t) => {
+  async function fetchWishlistPrices(
+    coverageIds: readonly number[],
+    opts: { refresh?: boolean; progress?: boolean } = {},
+  ): Promise<void> {
+    if (!tracks.wish) return;
+    const ids = Array.from(new Set(coverageIds));
+    const fetchIds = opts.refresh ? ids : ids.filter(id => !priceAttemptedIds.has(id));
+    if (fetchIds.length > 0) {
+      const emit = (loaded: number, t: number) => {
+        if (!opts.progress) return;
         try {
           controller.enqueue(sseEvent("progress", { phase: "fetching-prices", loaded, total: t }));
-        } catch { /* closed */ }
-      },
-      isCancelled,
-    );
-    // 커버리지는 이번에 실제로 확인한 가격(fresh 캐시 + 이번 조회 성공)만 센다. 조회 실패분을
-    // 채운 last-known(fallback)은 카드 표시용(회색)일 뿐 — 세면 Steam 장애 중에도 묵은 할인율로
-    // 가성비 순위·saleOnly가 조용히 바뀐다 (작업 지시서 20261010_02, 리뷰 L2).
-    const confirmed = Array.from(priceMap.values()).filter(s => !s.fallback).length;
-    priceFetchFailed = confirmed / wishlistPriceIds.length < FETCH_COVERAGE_MIN;
-    wishlistPricesFetchedAt = Date.now();
-    if (priceFetchFailed) {
-      logEvent("recommend_price_fetch_failed", {
-        steamId,
-        fetched: confirmed,
-        total: wishlistPriceIds.length,
-      });
+        } catch { /* closed — 탭 닫힘. isCancelled 경로로 조용히 끝나게 한다 (R4) */ }
+      };
+      emit(0, fetchIds.length);
+      const fetched = await getStoreItemPricesBatch(fetchIds, emit, isCancelled);
+      // 취소로 중간에 끊긴 경우 결과에 없는 appid는 시도하지 않은 것으로 남겨 둔다(어차피 곧 종료).
+      for (const id of fetchIds) {
+        if (!isCancelled() || fetched.has(id)) priceAttemptedIds.add(id);
+      }
+      priceMap = new Map([...(priceMap ?? []), ...fetched]);
+      // 스냅샷 신선도 기준 시각: 첫 조회 또는 전체 재조회 시에만 갱신한다. 증분 조회로 갱신하면
+      // 1시간 넘게 묵은 앞선 가격이 "방금 조회한 것"으로 보여 최종 단계 재조회가 생략된다.
+      if (opts.refresh || wishlistPricesFetchedAt === 0) wishlistPricesFetchedAt = Date.now();
     }
+    // 조회할 것이 없었어도(메타 있는 위시 0개 등) "가격 확인 완료" 상태로 둔다 — planWishlist가
+    // priceMap === undefined를 가격 미조회로 보기 때문.
+    priceMap ??= new Map();
+    if (ids.length === 0) {
+      priceFetchFailed = false;
+      return;
+    }
+    // 커버리지는 실제로 확인한 가격(fresh 캐시 + 조회 성공)만 센다. 조회 실패분을 채운
+    // last-known(fallback)은 카드 표시용(회색)일 뿐 — 세면 Steam 장애 중에도 묵은 할인율로
+    // 가성비 순위·saleOnly가 조용히 바뀐다 (작업 지시서 20261010_02, 리뷰 L2).
+    const map = priceMap;
+    const confirmed = ids.filter(id => {
+      const s = map.get(id);
+      return s !== undefined && !s.fallback;
+    }).length;
+    const failed = confirmed / ids.length < FETCH_COVERAGE_MIN;
+    // 로그는 실패로 바뀌는 순간만 — 주기 재블렌딩이 30초마다 같은 실패를 남기지 않도록.
+    if (failed && !priceFetchFailed) {
+      logEvent("recommend_price_fetch_failed", { steamId, fetched: confirmed, total: ids.length });
+    }
+    priceFetchFailed = failed;
   }
 
-  const shortlistSize = Math.min(
-    options.maxRecommendationsPerTrack * REVIEW_SHORTLIST_MULTIPLIER,
-    REVIEW_SHORTLIST_CAP,
-  );
+  /** 메타가 도착한(null 아님) 위시 appid = 위시 가격 조회 대상. */
+  const wishIdsWithMeta = (m: ReadonlyMap<number, SteamAppDetails | null>): number[] =>
+    wishMetaIds.filter(id => m.get(id));
+
+  /** 요청 옵션의 리뷰 블렌딩 shortlist 크기 (조기 위시 단계·발굴 트랙). */
+  const shortlistSize = shortlistSizeFor(options.maxRecommendationsPerTrack);
 
   /**
    * 위시 트랙 블렌딩 대상 산출 (가성비 계획 + saleOnly 가격 실패 처리).
@@ -839,14 +1021,21 @@ async function runAnalysis(
    * @param reviewCap 생략: shortlist 리뷰 요약을 전부 조회하며 진행률을 보낸다(조기 확정, 1회).
    *   지정: 캐시된 요약은 그대로 쓰고 미캐시는 최대 reviewCap개만 조회, 진행률 없음(주기 재블렌딩).
    *   상한을 넘은 후보는 중립 0.5로 블렌딩되고 다음 재블렌딩에서 채워진다.
+   * @param ownedAnalysis 같은 map으로 이미 계산한 라이브러리 분석 (조기 확정 경로가 재사용).
    * @returns 블렌딩 결과(배지 포함). 취소되면 null.
    */
   async function rankWishlist(
     map: ReadonlyMap<number, SteamAppDetails | null>,
     reviewCap?: number,
+    ownedAnalysis?: OwnedAnalysis,
   ): Promise<Recommendation[] | null> {
+    // 블렌딩 전에 메타가 있는 위시 가격을 확보한다. 이미 시도한 appid는 건너뛰므로 주기
+    // 재블렌딩에서는 그사이 메타가 도착한 위시만 조회된다(보통 배치 1회 이하).
+    await fetchWishlistPrices(wishIdsWithMeta(map), { progress: reviewCap === undefined });
+    if (isCancelled()) return null;
     const computed = computeRecommendations(
       ownedForAnalysis, wishlist, map, { lib: false, wish: true }, options, shortlistSize, priceMap, true,
+      ownedAnalysis,
     );
     const { targets, useDeal } = planWishlist(computed.wishlist, computed.wishlistAll);
     if (targets.length === 0) return [];
@@ -857,14 +1046,14 @@ async function runAnalysis(
       try {
         controller.enqueue(sseEvent("progress", { phase: "fetching-reviews", loaded: 0, total: ids.length }));
       } catch { /* closed (R4) */ }
-      summaries = await fetchReviewSummaries(
+      // 리뷰 요약: 6시간 캐시 → 미캐시분만 GetItems 배치(100개/호출). 진행률은 캐시분 처리 후와 배치마다
+      // 한 번씩만 오므로(호출 수가 적다) 거르지 않고 모두 보낸다.
+      summaries = await getReviewSummariesBatch(
         ids,
         (loaded, t) => {
-          if (loaded % 5 === 0 || loaded === t) {
-            try {
-              controller.enqueue(sseEvent("progress", { phase: "fetching-reviews", loaded, total: t }));
-            } catch { /* closed */ }
-          }
+          try {
+            controller.enqueue(sseEvent("progress", { phase: "fetching-reviews", loaded, total: t }));
+          } catch { /* closed */ }
         },
         isCancelled,
       );
@@ -876,14 +1065,18 @@ async function runAnalysis(
         if (s !== undefined) summaries.set(id, s);
         else missing.push(id);
       }
-      for (const id of missing.filter(m => !reviewFailedIds.has(m)).slice(0, reviewCap)) {
-        if (isCancelled()) return null;
-        const summary = await getReviewSummary(id);
-        summaries.set(id, summary);
-        if (summary === null) reviewFailedIds.add(id);
+      const toFetch = missing.filter(m => !reviewFailedIds.has(m)).slice(0, reviewCap);
+      if (toFetch.length > 0) {
+        const fetched = await getReviewSummariesBatch(toFetch, undefined, isCancelled);
+        for (const [id, summary] of fetched) {
+          summaries.set(id, summary);
+          if (summary === null) reviewFailedIds.add(id);
+        }
       }
     }
     if (isCancelled()) return null;
+    // 재정렬 풀이 쓰도록 모아 둔다 (조회 실패 null 포함 — 클라이언트가 같은 실패를 재요청하지 않게).
+    for (const [id, summary] of summaries) reviewMap.set(id, summary);
 
     const reviewScores = new Map(ids.map(id => [id, computeReviewScore(summaries.get(id) ?? null)]));
     return blendWishlistTrack(targets, reviewScores, options.maxRecommendationsPerTrack, useDeal)
@@ -894,10 +1087,10 @@ async function runAnalysis(
   }
 
   // 3a. phase A — 시드 + 위시리스트 메타.
-  // 캐시 히트 통계: getAppDetailsBatch가 한 게임 끝낼 때마다 onProgress 호출.
+  // 캐시 히트 통계: getStoreMetaBatch가 캐시분·배치마다 onProgress 호출.
   // 캐시 히트율을 측정하려면 캐시 인스턴스 노출이 필요한데 1차 범위에선 생략.
   // done 이벤트의 cacheHitRate는 0(미측정)으로 둔다.
-  const detailsMapA = await getAppDetailsBatch(phaseAIds, makeMetaProgress(0, new Map()), isCancelled);
+  const detailsMapA = await getStoreMetaBatch(phaseAIds, makeMetaProgress(0, new Map()), isCancelled);
   if (isCancelled()) return;
 
   // 3b. 조기 위시 단계 — 라이브러리 나머지(phase B)가 남아 있을 때만 의미가 있다.
@@ -905,15 +1098,21 @@ async function runAnalysis(
   //   즉시 보낸다. 최종 단계에서 전체 성향으로 다시 계산하지만, 가격(1h)·리뷰 요약(6h)이
   //   캐시되어 있어 재계산 비용은 거의 없다.
   if (tracks.wish && wishlist.length > 0 && phaseBIds.length > 0) {
-    // 위시 가격(위시리스트 전체, 100개/호출)·리뷰 조회는 대형 위시리스트에서 1분 이상 걸린다.
+    // 위시 가격(phase A 메타분, 100개/호출)·리뷰 조회는 대형 위시리스트에서 수십 초 걸릴 수 있다.
     // 그 전에 phase A(캐시분) 결과로 잠정 결과를 한 번 보내 라이브러리 트랙을 바로 보이게 한다.
     // 위시는 매칭 전용(saleOnly면 가격 확인 전이라 null) — 조기 확정 직후 교체된다.
     // 여기서 계산한 성향·라이브러리 트랙은 조기 확정 partial에서도 재사용한다(같은 detailsMapA).
-    const quick = computeRecommendations(ownedForAnalysis, wishlist, detailsMapA, tracks, options);
+    const quickBuilt = buildPool(detailsMapA);
+    const quickLists = rerankFromPool(quickBuilt.pool, options);
+    const quick = { profile: quickBuilt.profile, libraryUnplayed: quickLists.libraryUnplayed };
     {
-      const quickWish = options.saleOnly ? null : quick.wishlist;
+      // 가격 조회 전이라 saleOnly면 null (rerankFromPool).
+      const quickWish = quickLists.wishlist;
+      // 목록 모양만 비교한다 (makeMetaProgress의 sig와 같은 규칙). 이 이벤트는 풀을 항상 싣는다.
       const sig = computeResultSignature(quick.profile, quick.libraryUnplayed, quickWish);
-      if (sig !== lastEmittedSignature) {
+      // 목록이 같아도 풀이 마지막으로 보낸 것과 다르면 보낸다 — phase A partial이 목록만 보냈을 수 있다
+      // (풀은 30초 간격). 그렇지 않으면 화면(풀로 재정렬)이 최대 30초 묵은 풀에 머문다 (/code-review 5차 재검토 L1).
+      if (sig !== lastEmittedSignature || poolSignature(quickBuilt.pool) !== lastPoolSentSig) {
         lastEmittedSignature = sig;
         lastPartialEmitAt = Date.now();
         try {
@@ -921,12 +1120,18 @@ async function runAnalysis(
             profile: quick.profile,
             libraryUnplayed: quick.libraryUnplayed,
             wishlist: quickWish,
+            pool: quickBuilt.pool,
             loaded: phaseAIds.length,
             total,
           }));
         } catch { /* closed */ }
+        lastPoolSentSig = poolSignature(quickBuilt.pool);
+        lastPoolSentAt = Date.now();
         if (quickWish !== null) {
-          tryWriteCache(quick.profile, quick.libraryUnplayed, wishForCache(quickWish, detailsMapA));
+          tryWriteCache(
+            quick.profile, quick.libraryUnplayed, wishForCache(quickWish, detailsMapA),
+            poolForCache(quickBuilt.pool, detailsMapA),
+          );
         }
       }
     }
@@ -936,15 +1141,17 @@ async function runAnalysis(
     // 갱신하고, 가격은 최종 단계에서 조회한다 (작업 지시서 20261010_02 §3-1 가드).
     const seedHasSignal = quick.profile.genres.length > 0 || quick.profile.categories.length > 0;
     if (seedHasSignal) {
-      await fetchWishlistPrices();
-      if (isCancelled()) return;
-      const ranked = await rankWishlist(detailsMapA);
+      // 가격은 rankWishlist가 필요한 만큼(phase A 메타분 또는 노출 카드) 조회한다.
+      // detailsMapA는 phase A가 끝나 더 바뀌지 않으므로 잠정 결과에서 계산한 라이브러리 분석을 재사용한다.
+      const ranked = await rankWishlist(detailsMapA, undefined, quickBuilt.analysis);
       if (ranked === null || isCancelled()) return;
       // saleOnly + 가격 실패면 위시 트랙을 확정하지 않는다(null). 그러면 phase B partial도
       // null을 보내 클라이언트는 이전 state를 유지하고, 캐시에도 쓰지 않는다 — 빈 목록이
       // 저장되어 다음 방문에 "할인 게임 없음"으로 보이는 것을 막는다 (최종 쓰기 정책과 동일).
       earlyWishlist = options.saleOnly && priceFetchFailed ? null : ranked;
       lastWishRefreshAt = Date.now();
+      // 가격·리뷰가 채워졌으니 풀을 다시 만든다 (메타는 같은 detailsMapA — 성향·매칭 동일).
+      const earlyPool = buildPool(detailsMapA, quickBuilt.analysis).pool;
       // 다음 throttle 시점을 기다리지 않고 즉시 보낸다.
       lastEmittedSignature = computeResultSignature(quick.profile, quick.libraryUnplayed, earlyWishlist);
       lastPartialEmitAt = Date.now();
@@ -953,28 +1160,34 @@ async function runAnalysis(
           profile: quick.profile,
           libraryUnplayed: quick.libraryUnplayed,
           wishlist: earlyWishlist,
+          pool: earlyPool,
           loaded: phaseAIds.length,
           total,
         }));
+        lastPoolSentSig = poolSignature(earlyPool);
+        lastPoolSentAt = Date.now();
         // 진행 표시가 "리뷰 n/n"에 머물지 않도록 메타 단계로 즉시 되돌린다.
         controller.enqueue(sseEvent("progress", { phase: "fetching-meta", loaded: phaseAIds.length, total }));
       } catch { /* closed */ }
       if (earlyWishlist !== null) {
-        tryWriteCache(quick.profile, quick.libraryUnplayed, wishForCache(earlyWishlist, detailsMapA));
+        tryWriteCache(
+          quick.profile, quick.libraryUnplayed, wishForCache(earlyWishlist, detailsMapA),
+          poolForCache(earlyPool, detailsMapA),
+        );
       }
     }
   }
 
   // 3c. phase B — 미캐시 메타 (후보 → 나머지 라이브러리·위시 번갈아).
   phaseBActive = true;
-  const detailsMapB = await getAppDetailsBatch(
+  const detailsMapB = await getStoreMetaBatch(
     phaseBIds,
     makeMetaProgress(phaseAIds.length, detailsMapA),
     isCancelled,
   );
   phaseBActive = false;
   // 진행 중인 위시 재블렌딩이 있으면 끝나길 기다린다 — 그 리뷰 조회가 최종 단계의 리뷰 조회와
-  // 겹치지 않게(결과는 phaseBActive=false라 버려진다). 최대 리뷰 5건 ≈ 2.5초.
+  // 겹치지 않게(결과는 phaseBActive=false라 버려진다). 미캐시 리뷰는 GetItems 배치 1회(≤ EARLY_WISH_REVIEW_CAP개).
   if (wishRefreshInFlight) await wishRefreshInFlight;
   if (isCancelled()) return;
   const detailsMap = new Map([...detailsMapA, ...detailsMapB]);
@@ -984,90 +1197,64 @@ async function runAnalysis(
   //   - 조기 단계 가격이 PRICE_STALE_MS(1h)를 넘음 — 대형 라이브러리는 phase B가 1시간 넘게 걸려,
   //     그대로 쓰면 최종 순위·saleOnly가 그 사이 끝난 할인으로 계산되고 카드가 전부 회색이 된다.
   //   - 조기 단계 가격 조회가 커버리지 미달(priceFetchFailed) — Steam이 회복됐을 수 있다.
-  //     단, 마지막 시도 후 PRICE_RETRY_MIN_MS가 지났고 store backoff가 0(최근 429 없음)일 때만.
-  //     장애가 계속되는 중에 곧바로 같은 실패 조회(배치당 1.5s + backoff 최대 30s)를 반복하면
-  //     최종 result만 그만큼 더 늦어지고 결과는 같은 fallback이다 (/code-review 2차 R1 재검토).
+  //     단, 마지막 시도 후 PRICE_RETRY_MIN_MS가 지났을 때만. 장애가 계속되는 중에 곧바로 같은 실패
+  //     조회를 반복하면 최종 result만 늦어지고 결과는 같은 fallback이다 (/code-review 2차 R1 재검토).
+  //     (가격이 GetItems로 바뀌어 조건에서 store 429 backoff를 뺐다. 묶음 전용 게임의 appdetails 보충은
+  //     backoff 중이면 getStoreItemPricesBatch가 스스로 건너뛴다.)
   // 가격 캐시(1h)에 남은 것은 호출 없이 재사용되므로 재조회 비용은 만료·실패분만큼이다.
+  // 조기 단계 이후 메타가 도착한 위시(phase B)는 아직 시도 전이라 refresh 없이도 여기서 조회된다.
   const sincePriceFetch = Date.now() - wishlistPricesFetchedAt;
   const retryFailedPrices =
-    priceFetchFailed && sincePriceFetch >= PRICE_RETRY_MIN_MS && getAppDetailsBackoffMs() === 0;
-  if (priceMap === undefined || retryFailedPrices || sincePriceFetch > PRICE_STALE_MS) {
-    await fetchWishlistPrices();
-    if (isCancelled()) return;
-  }
+    priceFetchFailed && sincePriceFetch >= PRICE_RETRY_MIN_MS;
+  const refreshPrices = wishlistPricesFetchedAt > 0 && (retryFailedPrices || sincePriceFetch > PRICE_STALE_MS);
+  await fetchWishlistPrices(wishIdsWithMeta(detailsMap), { refresh: refreshPrices, progress: true });
+  if (isCancelled()) return;
 
-  // 4. 최종 분석 — 매칭 점수 기준 shortlist 산출 (블렌딩 재랭킹 여지를 위해 넉넉히).
+  // 4. 최종 분석 — 전체 메타로 재정렬 풀을 만든다 (라이브러리·위시 후보 + 가격 + 확보한 리뷰).
   controller.enqueue(sseEvent("progress", { phase: "analyzing", loaded: total, total }));
-
-  const shortlisted = computeRecommendations(
-    ownedForAnalysis, wishlist, detailsMap, tracks, options, shortlistSize, priceMap, true,
-  );
-  const profile = shortlisted.profile;
-
-  // 가성비 블렌딩 사용 여부 + 할인 후보 보강 (§1-4 ④⑤). 가격을 충분히 확보했을 때만
-  // 가성비 산식을 쓰고, 매칭 순위가 shortlist 밖이어도 할인 폭이 큰 후보를 블렌딩 대상에
-  // 넣는다(리뷰 조회가 최대 maxRecommendationsPerTrack개 늘어남).
-  const { targets: wishShortlist, useDeal } = planWishlist(shortlisted.wishlist, shortlisted.wishlistAll);
-
+  const { pool: finalPool, profile } = buildPool(detailsMap);
   if (isCancelled()) return;
 
   // 4b. 리뷰 호평률 블렌딩 (작업 지시서 단계 2).
-  //   - shortlist의 appid를 두 트랙 합쳐 dedupe → 리뷰 요약을 한 번씩만 조회.
-  //     소유한 위시 게임은 라이브러리 미플레이 후보와 겹칠 수 있으므로 dedupe가 필요하다.
-  //   - 라이브러리 트랙은 final에서만 블렌딩(partial은 match-only). 위시 트랙은 조기 단계에서
-  //     이미 블렌딩했더라도 전체 성향으로 다시 계산한다 — 리뷰 요약은 6시간 캐시라 거의 무비용.
-  //     final write는 force=true라 캐시 computed_at이 정상 갱신됨.
-  //   - 조회 실패/미포함 후보는 blendRecommendations 내부에서 중립 0.5로 흡수(탈락 없음).
-  const reviewAppIds = Array.from(new Set([
-    ...shortlisted.libraryUnplayed.map(r => r.appid),
-    ...wishShortlist.map(r => r.appid),
-  ]));
-
-  let libraryUnplayed: Recommendation[];
-  let wishlistRecs: Recommendation[];
-
+  //   - 요청 옵션으로 한 번 계산해 블렌딩 대상 중 리뷰 미확보 appid(missingReviewIds)를 얻고, 그것만
+  //     조회한다. 대상 = 라이브러리 shortlist + 위시 블렌딩 대상(가성비 할인 보강 포함), 두 트랙 합쳐
+  //     dedupe(소유한 위시 게임은 라이브러리 후보와 겹칠 수 있음).
+  //   - 위시 트랙은 조기 단계에서 블렌딩했더라도 전체 성향으로 다시 계산한다 — 리뷰 요약은 6시간
+  //     캐시라 거의 무비용(buildPool이 캐시분을 이미 풀에 넣어 둠).
+  //   - 조회 실패 후보는 null로 넣어 중립 0.5로 흡수(탈락 없음).
+  //   - 최종 목록은 클라이언트 재정렬과 같은 rerankFromPool로 만든다.
+  const reviewAppIds = rerankFromPool(finalPool, options).missingReviewIds;
   if (reviewAppIds.length > 0) {
     controller.enqueue(sseEvent("progress", { phase: "fetching-reviews", loaded: 0, total: reviewAppIds.length }));
-    const summaryMap = await fetchReviewSummaries(
+    // 진행률은 배치 단위로 띄엄띄엄 오므로 모두 보낸다 (위 rankWishlist와 같은 이유).
+    const summaryMap = await getReviewSummariesBatch(
       reviewAppIds,
       (loaded, t) => {
-        if (loaded % 5 === 0 || loaded === t) {
-          try {
-            controller.enqueue(sseEvent("progress", { phase: "fetching-reviews", loaded, total: t }));
-          } catch { /* closed */ }
-        }
+        try {
+          controller.enqueue(sseEvent("progress", { phase: "fetching-reviews", loaded, total: t }));
+        } catch { /* closed */ }
       },
       isCancelled,
     );
     if (isCancelled()) return;
-
-    const reviewScoreByAppid = new Map<number, number>(
-      reviewAppIds.map(id => [id, computeReviewScore(summaryMap.get(id) ?? null)]),
-    );
-    // 블렌딩(랭킹) 후 최종 노출 카드에만 표시용 호평률 배지를 부착한다.
-    //   - 랭킹은 정규화 reviewScore로, 배지는 실제 호평 %로 (buildReviewBadge).
-    //   - 요약 조회 실패(summary=null)인 후보는 배지 없이 통과.
-    //   - truncate 후 결과(≤maxPerTrack)에만 map하므로 비용 미미.
-    const attachBadges = (recs: Recommendation[]): Recommendation[] =>
-      recs.map(r => {
-        const badge = buildReviewBadge(summaryMap.get(r.appid) ?? null);
-        return badge ? { ...r, reviewBadge: badge } : r;
-      });
-    libraryUnplayed = attachBadges(blendRecommendations(shortlisted.libraryUnplayed, reviewScoreByAppid, options.maxRecommendationsPerTrack));
-    // 위시 트랙만 가성비 산식. useDeal=false면 기존 산식 그대로.
-    wishlistRecs = attachBadges(blendWishlistTrack(wishShortlist, reviewScoreByAppid, options.maxRecommendationsPerTrack, useDeal));
-  } else {
-    // 매칭 후보가 하나도 없으면(shortlist 빈 배열) 리뷰 조회 생략. 그대로 truncate.
-    libraryUnplayed = shortlisted.libraryUnplayed.slice(0, options.maxRecommendationsPerTrack);
-    wishlistRecs = wishShortlist.slice(0, options.maxRecommendationsPerTrack);
+    for (const [id, summary] of summaryMap) {
+      reviewMap.set(id, summary);
+      finalPool.reviews[id] = summary;
+    }
   }
-  if (isCancelled()) return;
+  const finalLists = rerankFromPool(finalPool, options);
+  const libraryUnplayed = finalLists.libraryUnplayed;
+  // null은 saleOnly + 가격 조회 전인데, 최종 단계에서는 가격 조회를 마쳤으므로 생기지 않는다(방어).
+  const wishlistRecs = finalLists.wishlist ?? [];
 
   // 5. result — 라이브러리·위시 트랙 확정. 발굴(tracks.deal)은 이 뒤에 별도로 진행한다.
+  //    pool: 클라이언트가 가성비·할인만·개수를 바꿀 때 서버 재요청 없이 재정렬하는 데 쓴다.
   controller.enqueue(sseEvent("result", {
     profile,
     libraryUnplayed,
     wishlist: wishlistRecs,
+    pool: finalPool,
+    priceFetchFailed: tracks.wish && priceFetchFailed,
   }));
 
   // 6. 캐시 저장 — partial과 동일한 tryWriteCache 헬퍼 사용. 가드 정책은 헬퍼
@@ -1075,16 +1262,14 @@ async function runAnalysis(
   //    있는 signal" 가드(genres + categories 모두 빔 차단)로 자연히 막힌다.
   //    force=true: 마지막 partial과 sig가 우연히 일치해도 final write는 반드시
   //    수행하여 computed_at이 분석 완료 시각으로 갱신되도록.
-  //    saleOnly + 위시 가격 조회 실패는 위시 트랙을 비운 일시 장애 결과다 — 캐시에 굳히면
-  //    다음 방문의 cached 결과가 (priceFetchFailed 정보 없이) "할인 게임 없음"처럼 보인다.
-  //    saleOnly가 아니면 가격 실패 시 결과가 기존 산식 순위라 그대로 유효하므로 저장한다.
+  //    위시 가격 조회 실패도 저장한다 — 캐시 키가 재정렬 옵션(할인만 등)과 무관해져, 실패 여부를
+  //    payload의 priceFetchFailed로 함께 저장하고 클라이언트가 그것을 보고 "할인 게임 없음" 대신
+  //    가격 실패 안내를 띄운다. (이전에는 saleOnly + 가격 실패를 저장하지 않았다 — 실패 정보 없이
+  //    빈 목록이 캐시되는 것을 막기 위해서였다.)
   //    발굴 전에 먼저 저장한다 — 발굴(최대 120초) 도중 탭을 닫아도 두 트랙 결과는 남도록.
   //    이 시점의 payload엔 이전 분석의 발굴 결과(carriedStoreDeals, 없으면 생략)가 들어가고,
   //    이번 발굴이 저장 가능한 결과를 내면 아래에서 한 번 더 덮어쓴다.
-  const canWriteFinal = !(tracks.wish && options.saleOnly && priceFetchFailed);
-  if (canWriteFinal) {
-    tryWriteCache(profile, libraryUnplayed, wishlistRecs, true);
-  }
+  tryWriteCache(profile, libraryUnplayed, wishlistRecs, finalPool, true);
 
   // 7. 미보유 할인 게임 발굴 (tracks.deal, 작업 지시서 20261010_01 단계 2).
   //    실패 격리: 발굴 단계의 어떤 예외도 여기서 흡수하고 두 트랙 결과(이미 전송)에 영향을
@@ -1097,7 +1282,7 @@ async function runAnalysis(
       outcome = await discoverStoreDeals(profile);
     } catch (err) {
       console.warn("[recommend] store deal discovery failed:", err);
-      outcome = { storeDeals: [], failed: true, truncated: false };
+      outcome = { storeDeals: [], failed: true, truncated: false, pool: [], reviews: {} };
     }
     if (outcome === null || isCancelled()) return; // 탭 닫힘 — 즉시 중단
     storeDealsFailed = outcome.failed;
@@ -1111,7 +1296,13 @@ async function runAnalysis(
         storeDeals: outcome.storeDeals,
         failed: outcome.failed,
         truncated: outcome.truncated,
+        // 재정렬용 발굴 shortlist + 그 리뷰(GetItems 요약). 클라이언트가 개수 변경 시 다시 계산한다.
+        pool: outcome.pool,
+        reviews: outcome.reviews,
         ...(outcome.failed && carriedStoreDeals !== undefined ? { previous: carriedStoreDeals } : {}),
+        ...(outcome.failed && carriedPool?.storeDeals !== undefined
+          ? { previousPool: carriedPool.storeDeals, previousReviews: pickReviews(carriedPool, carriedPool.storeDeals) }
+          : {}),
       }));
     } catch { /* closed */ }
     logEvent("recommend_store_deals", {
@@ -1126,14 +1317,16 @@ async function runAnalysis(
     // 없으므로, 일부만 확인한 결과도 비어 있으면 같은 이유로 저장하지 않는다. 일부만 확인했어도
     // 찾은 게임이 있으면 그 자체로 유효한 추천이라 저장한다.
     const storable = !outcome.failed && (!outcome.truncated || outcome.storeDeals.length > 0);
-    if (canWriteFinal && storable) {
-      tryWriteCache(profile, libraryUnplayed, wishlistRecs, true, outcome.storeDeals);
-    } else if (canWriteFinal && carriedStoreDeals !== undefined) {
+    if (storable) {
+      tryWriteCache(profile, libraryUnplayed, wishlistRecs, finalPool, true, {
+        list: outcome.storeDeals, pool: outcome.pool, reviews: outcome.reviews,
+      });
+    } else if (carriedStoreDeals !== undefined || carriedPool?.storeDeals !== undefined) {
       // result 직후 쓰기에는 이전 분석의 발굴 결과가 이어 써져 있다. 이번 발굴이 저장할 수 없는
       // 결과면 그 묵은 목록이 다음 방문에 (실패 사실 없이) 현재 결과처럼 보이므로 빼고 다시 쓴다.
       // 다음 방문은 storeDeals 없는 캐시 → "찾는 중"으로 시작한다. 이번 화면에는 store-deals의
       // previous로 이전 결과가 "이전 결과" 안내와 함께 계속 보인다.
-      tryWriteCache(profile, libraryUnplayed, wishlistRecs, true, null);
+      tryWriteCache(profile, libraryUnplayed, wishlistRecs, finalPool, true, null);
     }
   }
 
@@ -1170,7 +1363,7 @@ async function runAnalysis(
    *                      filterDiscoverPool             — 소유·위시리스트 제외
    *   fetching-prices    getStoreItemsBatch(pool)       — 가격·리뷰 요약·카테고리 (GetItems, 2회)
    *                      selectDealCandidatesForMeta    — 할인 중 + 리뷰 ≥ 10 + dealScore 상위 40
-   *   fetching-deal-meta getAppDetailsBatch(selected)   — 장르 메타 (GetItems에 장르 없음)
+   *   fetching-deal-meta getStoreMetaBatch(selected)    — 장르(태그)·카테고리 메타 (GetItems 배치)
    *                      recommendStoreDeals            — 매칭 shortlist
    *                      blendRecommendations(+deal)    — 리뷰는 GetItems 요약으로 (추가 호출 없음)
    *
@@ -1197,8 +1390,13 @@ async function runAnalysis(
       } catch { /* closed */ }
     };
     let partial = false;
-    const done = (storeDeals: Recommendation[], failed = false): DiscoverOutcome => ({
-      storeDeals, failed, truncated: !failed && partial, elapsedMs: Date.now() - startedAt,
+    const done = (
+      storeDeals: Recommendation[],
+      failed = false,
+      pool: Recommendation[] = [],
+      reviews: RerankPool["reviews"] = {},
+    ): DiscoverOutcome => ({
+      storeDeals, failed, truncated: !failed && partial, elapsedMs: Date.now() - startedAt, pool, reviews,
     });
 
     // 위시리스트를 못 불러왔으면 위시 게임을 제외할 수 없어 "미보유·위시 밖" 계약을 지킬 수 없다.
@@ -1222,10 +1420,23 @@ async function runAnalysis(
 
     // (3) 가격·리뷰 요약·카테고리 (GetItems). 조회 실패·예산 중단분은 Map에서 빠진다.
     emit("fetching-prices", 0, filtered.length);
-    const items = await getStoreItemsBatch(filtered, (loaded, t) => emit("fetching-prices", loaded, t), stop);
+    // getStoreItemsBatch는 캐시분 처리 후와 배치마다 onProgress(loaded, total)를 부르고, 끝까지
+    // 진행했으면 마지막 호출이 loaded === total이다. 이것으로 "남은 배치를 실제로 건너뛰었는지"를 판정한다.
+    let itemsComplete = false;
+    const items = await getStoreItemsBatch(
+      filtered,
+      (loaded, t) => {
+        itemsComplete = loaded >= t;
+        emit("fetching-prices", loaded, t);
+      },
+      stop,
+    );
     if (isCancelled()) return null;
     // 예산 초과로 남은 배치를 건너뛰었으면 "일부만 확인"이지 실패가 아니다(첫 배치 전 중단 포함).
-    const itemsStopped = stop();
+    // 반환 직후 stop()으로 판정하면 마지막 배치가 예산 경계를 넘겨 끝난 경우도 "건너뜀"으로 잡혀,
+    // 전부 확인했는데 "일부만 확인" 안내가 뜨고, 전 배치 실패가 failed 대신 truncated로 보고됐다
+    // (/code-review 3차 #4).
+    const itemsStopped = !itemsComplete;
     if (itemsStopped) partial = true;
     if (items.size === 0) return done([], !itemsStopped);
     if (items.size < filtered.length * FETCH_COVERAGE_MIN) partial = true;
@@ -1236,9 +1447,11 @@ async function runAnalysis(
 
     // (5) 장르 메타 — 기존 uniqueIds 배치와 분리된 2차 배치 (성향 확정 후 후보만)
     emit("fetching-deal-meta", 0, selected.length);
-    const metas = await getAppDetailsBatch(
+    const metas = await getStoreMetaBatch(
       selected,
-      (loaded, t) => { if (loaded % 5 === 0 || loaded === t) emit("fetching-deal-meta", loaded, t); },
+      // getStoreMetaBatch 진행률은 캐시분 처리 후·배치(100개)마다 한 번이라 37/40처럼 건너뛰며 온다.
+      // 5의 배수만 보내면 그런 값이 버려져 0/40에 머문다 (/code-review 5차 #7) — 모두 보낸다.
+      (loaded, t) => emit("fetching-deal-meta", loaded, t),
       stop,
     );
     if (isCancelled()) return null;
@@ -1256,22 +1469,19 @@ async function runAnalysis(
       const c = buildStoreDealCandidate(metas.get(id) ?? null, item);
       if (c) candidates.push(c);
     }
-    const shortlist = recommendStoreDeals(candidates, currentProfile, options, shortlistSize);
-    if (shortlist.length === 0) return done([]);
+    // 재정렬 풀용으로 상한(CAP)까지 뽑는다 — 클라이언트가 개수를 늘려도 서버 재요청 없이 계산하도록.
+    // 리뷰는 GetItems 요약으로 이미 확보돼 있어 추가 호출이 없다.
+    const poolShortlist = recommendStoreDeals(candidates, currentProfile, options, REVIEW_SHORTLIST_CAP);
+    if (poolShortlist.length === 0) return done([]);
 
-    // (7) 블렌딩 — 리뷰는 GetItems 요약(이미 확보), deal은 항상 반영.
-    const reviewScores = new Map<number, number>();
-    const dealScores = new Map<number, number>();
-    for (const r of shortlist) {
-      reviewScores.set(r.appid, computeReviewScore(items.get(r.appid)?.review ?? null));
-      dealScores.set(r.appid, computeDealScore(r.price));
-    }
-    const ranked = blendRecommendations(shortlist, reviewScores, options.maxRecommendationsPerTrack, dealScores)
-      .map(r => {
-        const badge = buildReviewBadge(items.get(r.appid)?.review ?? null);
-        return badge ? { ...r, reviewBadge: badge } : r;
-      });
-    return done(ranked);
+    // (7) 블렌딩 — 리뷰는 GetItems 요약, deal은 항상 반영. 클라이언트와 같은 rerankFromPool 규칙.
+    const reviews: RerankPool["reviews"] = {};
+    for (const r of poolShortlist) reviews[r.appid] = items.get(r.appid)?.review ?? null;
+    const ranked = rerankFromPool(
+      { library: [], wishlist: [], storeDeals: poolShortlist, reviews, wishPricesReady: true, wishPriceOk: true },
+      options,
+    ).storeDeals ?? [];
+    return done(ranked, false, poolShortlist, reviews);
   }
 }
 
@@ -1284,4 +1494,8 @@ interface DiscoverOutcome {
   truncated: boolean;
   /** 소요 시간 (ms). 로그·측정용 (완료 기준의 소요 측정). */
   elapsedMs?: number;
+  /** 재정렬 풀용 발굴 shortlist (매칭순, 상한 CAP). 실패·빈 결과면 []. */
+  pool: Recommendation[];
+  /** pool 후보의 리뷰 요약 (GetItems). */
+  reviews: RerankPool["reviews"];
 }

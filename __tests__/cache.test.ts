@@ -90,3 +90,32 @@ describe("cache", () => {
     expect(CACHE_TTL.reviews).toBe(15 * 60 * 1000);
   });
 });
+
+describe("게임 단위 대량 키 전용 LRU", () => {
+  it("storemeta·reviewsummary·storeitem·가격 키는 별도 인스턴스에 들어가 일반 캐시 용량을 쓰지 않는다", () => {
+    const before = cacheStats();
+    cacheSet("storemeta:1:KR", { name: "A" }, 60_000);
+    cacheSet("reviewsummary:1", null, 60_000);
+    cacheSet("storeitem:1:KR", {}, 60_000);
+    cacheSet("app:1:price:KR", null, 60_000);
+    const after = cacheStats();
+    expect(after.size).toBe(before.size);
+    expect(after.gameSize).toBe(before.gameSize + 4);
+    expect(cacheGet("storemeta:1:KR")?.data).toEqual({ name: "A" });
+    // null 값도 히트로 조회된다 (리뷰 없음·판매 불가)
+    expect(cacheGet("reviewsummary:1")).not.toBeNull();
+    // 일반 키는 기존 인스턴스
+    cacheSet("app:1:info", { x: 1 }, 60_000);
+    expect(cacheStats().size).toBe(before.size + 1);
+    cacheDelete("app:1:info");
+  });
+
+  it("delete·prefix 삭제는 두 인스턴스 모두에 적용된다", () => {
+    cacheSet("storemeta:2:KR", {}, 60_000);
+    cacheDelete("storemeta:2:KR");
+    expect(cacheGet("storemeta:2:KR")).toBeNull();
+    cacheSet("reviewsummary:3", {}, 60_000);
+    cacheDeleteByPrefix("reviewsummary:");
+    expect(cacheGet("reviewsummary:3")).toBeNull();
+  });
+});

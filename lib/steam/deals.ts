@@ -7,6 +7,7 @@
  */
 
 import { computeDealScore, isOnSale } from "./profile";
+import { storeItemIsFreeToPlay, storeItemPriceIsAppPrice } from "./store-meta";
 import type {
   SteamStoreBrowseItem,
   StoreItemSummary,
@@ -20,6 +21,12 @@ import type {
 
 /** 검색 결과 행의 여는 <a> 태그. 속성 안에 '>'가 없다는 가정(실응답에서 성립)으로 태그 단위로 자른다. */
 const ROW_TAG_RE = /<a\s[^>]*data-ds-appid="[^"]*"[^>]*>/g;
+/**
+ * 행 수 세기용: appid가 없는 행도 포함한다. 번들 행은 data-ds-appid 없이 data-ds-bundleid만
+ * 있는 경우가 많아 ROW_TAG_RE로는 빠진다 — 그러면 번들만 있는 페이지를 "빈 페이지"로 보고 순회를
+ * 멈춘다 (/code-review 4차 #6). 행 클래스(search_result_row)도 함께 본다.
+ */
+const ANY_ROW_TAG_RE = /<a\s[^>]*(?:data-ds-(?:appid|packageid|bundleid)="|class="[^"]*\bsearch_result_row\b)[^>]*>/g;
 const APPID_ATTR_RE = /data-ds-appid="([^"]*)"/;
 
 /**
@@ -49,6 +56,18 @@ export function parseSearchResultAppIds(html: string): number[] {
     out.push(appid);
   }
   return out;
+}
+
+/**
+ * results_html에 들어 있는 검색 결과 행 수 (패키지·번들·다중 앱 행 포함).
+ *
+ * getStoreSpecials가 "빈 페이지(마크업 이상·결과 끝)"와 "행은 있는데 단일 게임이 없는 페이지
+ * (패키지·번들만)"를 구분하는 데 쓴다. parseSearchResultAppIds가 빈 배열이어도 행이 있으면
+ * 정상 페이지이므로 다음 페이지로 넘어가야 한다 (/code-review 3차 #7).
+ */
+export function countSearchResultRows(html: string): number {
+  if (typeof html !== "string" || html.length === 0) return 0;
+  return Array.from(html.matchAll(ANY_ROW_TAG_RE)).length;
 }
 
 // ============================================================================
@@ -121,7 +140,10 @@ export function storeItemToReviewSummary(item: SteamStoreBrowseItem): ReviewSumm
 export function normalizeStoreItem(item: SteamStoreBrowseItem, fetchedAt: number): StoreItemSummary | null {
   const appid = item.appid ?? item.id;
   if (item.success !== 1 || typeof appid !== "number" || appid <= 0) return null;
-  const price = storeItemToPrice(item);
+  // 게임 자신의 가격일 때만 가격으로 쓴다 (storeItemPriceIsAppPrice). 묶음·세트 전용 옵션의 가격을 쓰면
+  // 발굴 트랙에 묶음 가격·할인율이 그 게임의 할인처럼 보인다. F2P는 0원 옵션이 와도 null(무료).
+  // 그 밖의 경우 null — 발굴 트랙은 할인(discount_percent > 0)만 보므로 자연히 빠진다.
+  const price = !storeItemIsFreeToPlay(item) && storeItemPriceIsAppPrice(item) ? storeItemToPrice(item) : null;
   const c = item.categories;
   const categoryIds = Array.from(new Set([
     ...(c?.supported_player_categoryids ?? []),
@@ -138,7 +160,8 @@ export function normalizeStoreItem(item: SteamStoreBrowseItem, fetchedAt: number
     price,
     review: storeItemToReviewSummary(item),
     categoryIds,
-    isFree: !!item.is_free,
+    // 100% 할인 배포(한정 무료)는 F2P가 아니다 (storeItemIsFreeToPlay).
+    isFree: storeItemIsFreeToPlay(item),
     ...(discountEndsAt !== undefined ? { discountEndsAt } : {}),
     fetchedAt,
   };

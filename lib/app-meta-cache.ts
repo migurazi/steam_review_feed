@@ -77,6 +77,35 @@ export function setAppMeta(
 }
 
 /**
+ * store 출처 entry 여러 개를 단일 트랜잭션으로 저장한다 — setAppMeta와 같은 규칙(이름 덮어쓰기,
+ * header_image는 COALESCE로 빈 값이면 기존 보존).
+ *
+ * GetItems 메타 배치(getStoreMetaBatch)가 쓴다. 이전 appdetails 경로는 게임마다 setAppMeta를 불러
+ * app_meta를 채웠고 도전과제 탭(achievement-scan)이 그 이름·헤더 이미지를 읽는다. GetItems로 바꾼 뒤에도
+ * 같은 캐시를 채워야 헤더 이미지가 빠지지 않는다 (/code-review 4차 #4).
+ * setAppMetaBatch(라이브러리 출처, INSERT OR IGNORE)와 달리 store 값이 기존 값을 이긴다.
+ */
+export function setAppMetaFromStoreBatch(
+  entries: { appId: number; name: string; headerImage?: string | null }[]
+): void {
+  const valid = entries.filter(e => e.name);
+  if (valid.length === 0) return;
+  const db = getDb();
+  const stmt = db.prepare(
+    `INSERT INTO app_meta (app_id, name, header_image, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(app_id) DO UPDATE SET
+       name = excluded.name,
+       header_image = COALESCE(excluded.header_image, app_meta.header_image),
+       updated_at = excluded.updated_at`
+  );
+  const now = Date.now();
+  db.transaction((rows: typeof valid) => {
+    for (const r of rows) stmt.run(r.appId, r.name, r.headerImage ? r.headerImage : null, now);
+  })(valid);
+}
+
+/**
  * 다수 entry를 단일 트랜잭션으로 batch 저장한다. 라이브러리 응답
  * (IPlayerService/GetOwnedGames)의 5000+ 게임을 한 번에 처리하는 hot path.
  *

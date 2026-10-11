@@ -174,6 +174,20 @@ describe("getStoreSpecials", () => {
     expect(fakeCache.has("store:specials:KR")).toBe(false);
   });
 
+  it("패키지·번들 행만 있는 페이지는 이상이 아니다 — 다음 페이지로 진행 (/code-review 3차 #7)", async () => {
+    const pkgOnly = '<a href="x" data-ds-packageid="460" data-ds-appid="4700,4780">pkg</a>'
+      + '<a href="y" data-ds-bundleid="9" data-ds-appid="10">bundle</a>';
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ success: 1, results_html: pkgOnly, total_count: 3593, start: 0 }))
+      .mockResolvedValueOnce(jsonResponse({ ...searchP0, start: 100 }))
+      .mockResolvedValueOnce(jsonResponse({ success: 1, results_html: "", total_count: 3593, start: 200 }));
+    const out = await run(getStoreSpecials(150));
+    // featured fallback으로 빠지지 않고 두 번째 검색 페이지를 조회했다
+    expect(String(fetchMock.mock.calls[1][0])).toContain("start=100");
+    expect(String(fetchMock.mock.calls[1][0])).not.toContain("featuredcategories");
+    expect(out!.ids).toEqual(p0Ids);
+  });
+
   it("total_count 이후 페이지의 0행은 정상 끝", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse({ ...searchP0, total_count: 150 }))

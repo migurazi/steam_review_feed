@@ -946,6 +946,33 @@ export function recommendStoreDeals(
 // ============================================================================
 
 /**
+ * appdetails 메타 → 장르·카테고리 id 목록과 라벨 맵.
+ *
+ * 세 결합 헬퍼(라이브러리·위시·store-deal)가 같은 규칙을 쓰도록 한 곳에 둔다 — 라벨 fallback이나
+ * 카테고리 필터를 바꿀 때 한 군데만 고치면 된다 (/code-review 3차 #9).
+ * details가 null(메타 조회 실패)이면 전부 빈 값 — 분석은 통과하되 점수 0 기여.
+ */
+function buildMetaLabels(details: SteamAppDetails | null): {
+  genreIds: string[];
+  categoryIds: number[];
+  genreLabels: Record<string, string>;
+  categoryLabels: Record<number, string>;
+} {
+  const genres = details?.genres ?? [];
+  const categories = details?.categories ?? [];
+  const genreLabels: Record<string, string> = {};
+  const categoryLabels: Record<number, string> = {};
+  for (const g of genres) genreLabels[g.id] = g.description;
+  for (const c of categories) categoryLabels[c.id] = c.description;
+  return {
+    genreIds: genres.map(g => g.id),
+    categoryIds: categories.map(c => c.id),
+    genreLabels,
+    categoryLabels,
+  };
+}
+
+/**
  * SteamOwnedGame + 메타 맵 → OwnedAnalyzedGame.
  * 메타가 없으면 빈 배열 fallback (분석 통과, 점수 0 기여).
  *
@@ -955,19 +982,14 @@ export function buildOwnedAnalyzedGame(
   owned: SteamOwnedGame,
   details: SteamAppDetails | null
 ): OwnedAnalyzedGame {
-  const genres = details?.genres ?? [];
-  const categories = details?.categories ?? [];
-  const genreLabels: Record<string, string> = {};
-  const categoryLabels: Record<number, string> = {};
-  for (const g of genres) genreLabels[g.id] = g.description;
-  for (const c of categories) categoryLabels[c.id] = c.description;
+  const { genreIds, categoryIds, genreLabels, categoryLabels } = buildMetaLabels(details);
   return {
     appid: owned.appid,
     name: owned.name || details?.name || `AppID ${owned.appid}`,
     playtimeMinutes: owned.playtime_forever,
     recent2wMinutes: owned.playtime_2weeks ?? 0,
-    genreIds: genres.map(g => g.id),
-    categoryIds: categories.map(c => c.id),
+    genreIds,
+    categoryIds,
     genreLabels,
     categoryLabels,
     isFree: details?.is_free ?? false,
@@ -991,19 +1013,14 @@ export function buildWishlistAnalyzedGame(
    */
   priceSnapshot?: PriceSnapshot
 ): WishlistAnalyzedGame {
-  const genres = details?.genres ?? [];
-  const categories = details?.categories ?? [];
-  const genreLabels: Record<string, string> = {};
-  const categoryLabels: Record<number, string> = {};
-  for (const g of genres) genreLabels[g.id] = g.description;
-  for (const c of categories) categoryLabels[c.id] = c.description;
+  const { genreIds, categoryIds, genreLabels, categoryLabels } = buildMetaLabels(details);
   return {
     appid: item.appid,
     name: details?.name ?? `AppID ${item.appid}`,
     priority: item.priority,
     dateAddedUnix: item.date_added,
-    genreIds: genres.map(g => g.id),
-    categoryIds: categories.map(c => c.id),
+    genreIds,
+    categoryIds,
     genreLabels,
     categoryLabels,
     isFree: details?.is_free ?? false,
@@ -1016,8 +1033,8 @@ export function buildWishlistAnalyzedGame(
 /**
  * appdetails 메타 + GetItems 요약 → StoreDealCandidate (store-deal 트랙).
  *
- * - 장르·카테고리와 그 라벨은 appdetails를 쓴다. GetItems는 장르가 없고 카테고리 라벨도
- *   없기 때문(부록 B V2). 카테고리 id 체계는 둘이 같다.
+ * - 장르·카테고리와 그 라벨은 성향 분석 메타(getStoreMetaBatch → storeItemToAppDetails)를 쓴다.
+ *   GetItems 원본에는 장르가 없어 장르 태그로 만들고, 카테고리 라벨은 GetStoreCategories로 붙인다.
  * - 가격은 GetItems(신선, 1시간 캐시)를 쓴다. details.price_overview는 캐시 경로에 따라
  *   묵었거나 없으므로 쓰지 않는다 (위시 트랙과 같은 원칙).
  * - details가 null(메타 조회 실패)이면 null — 장르 없이는 매칭할 수 없다.
@@ -1027,21 +1044,17 @@ export function buildStoreDealCandidate(
   item: StoreItemSummary
 ): StoreDealCandidate | null {
   if (!details) return null;
-  const genres = details.genres ?? [];
-  const categories = details.categories ?? [];
-  const genreLabels: Record<string, string> = {};
-  const categoryLabels: Record<number, string> = {};
-  for (const g of genres) genreLabels[g.id] = g.description;
-  for (const c of categories) categoryLabels[c.id] = c.description;
+  const { genreIds, categoryIds, genreLabels, categoryLabels } = buildMetaLabels(details);
   return {
     appid: item.appid,
     name: details.name || `AppID ${item.appid}`,
     headerImage: details.header_image,
-    // appdetails is_free(=F2P)만 쓴다. GetItems is_free는 100% 할인 배포(한정 무료)에도 true라
+    // 메타의 is_free(=F2P)만 쓴다. GetItems 원본 is_free는 100% 할인 배포(한정 무료)에도 true라
     // 섞으면 excludeFree(F2P 노이즈 제거 목적)가 가장 좋은 할인을 걸러 버린다 (실응답 확인).
+    // 메타(storeItemToAppDetails)는 storeItemIsFreeToPlay로 이 둘을 구분해 둔다.
     isFree: details.is_free,
-    genreIds: genres.map(g => g.id),
-    categoryIds: categories.map(c => c.id),
+    genreIds,
+    categoryIds,
     genreLabels,
     categoryLabels,
     price: item.price,

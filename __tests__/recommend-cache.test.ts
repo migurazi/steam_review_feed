@@ -75,7 +75,7 @@ describe("hashOptions", () => {
     expect(h({ ...DEFAULT_ANALYZE_OPTIONS, unplayedMaxMinutes: 30 })).not.toBe(base);
     expect(h({ ...DEFAULT_ANALYZE_OPTIONS, excludeFree: true })).not.toBe(base);
     expect(h({ ...DEFAULT_ANALYZE_OPTIONS, topNTaste: 12 })).not.toBe(base);
-    expect(h({ ...DEFAULT_ANALYZE_OPTIONS, maxRecommendationsPerTrack: 30 })).not.toBe(base);
+    expect(h({ ...DEFAULT_ANALYZE_OPTIONS, fastMode: true })).not.toBe(base);
   });
 
   it("excludeFree true/false를 구분한다", () => {
@@ -107,10 +107,14 @@ describe("hashOptions", () => {
     expect(full).not.toBe(fast);
   });
 
-  it("valueWeighting/saleOnly 차이는 캐시 키를 분리한다 (작업 지시서 20261010_01 §1-3)", () => {
+  it("재정렬 옵션(가성비·할인만·개수)은 캐시 키에서 제외된다 — 풀로 클라이언트가 재계산", () => {
     const base = h({ ...DEFAULT_ANALYZE_OPTIONS });
-    expect(h({ ...DEFAULT_ANALYZE_OPTIONS, valueWeighting: false })).not.toBe(base);
-    expect(h({ ...DEFAULT_ANALYZE_OPTIONS, saleOnly: true })).not.toBe(base);
+    expect(h({ ...DEFAULT_ANALYZE_OPTIONS, valueWeighting: false })).toBe(base);
+    expect(h({ ...DEFAULT_ANALYZE_OPTIONS, saleOnly: true })).toBe(base);
+    expect(h({ ...DEFAULT_ANALYZE_OPTIONS, maxRecommendationsPerTrack: 30 })).toBe(base);
+    expect(base).not.toContain("valueWeighting");
+    expect(base).not.toContain("saleOnly");
+    expect(base).not.toContain("maxRecommendationsPerTrack");
   });
 
   it("키 순서에 영향받지 않는다 (객체 spread 순서 무관)", () => {

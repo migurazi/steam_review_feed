@@ -212,7 +212,7 @@ describe("getAppPrice", () => {
 
   it("stale 캐시면 stale을 즉시 반환하고 백그라운드에서 재조회한다 (기존 결함 수정)", async () => {
     const old: SteamPriceOverview = { ...witcher, final_formatted: "OLD" };
-    fakeCache.set("app:292030:price:KR", { data: old, fetchedAt: 1, isStale: true });
+    fakeCache.set("app:292030:price:KR", { data: old, fetchedAt: Date.now() - 2 * 60 * 60 * 1000, isStale: true });
     fetchMock.mockResolvedValueOnce(jsonResponse({ "292030": multi5["292030"] }));
     // 타이머(딜레이)를 돌리기 전에 이미 응답이 나온다 — 사용자 응답이 딜레이에 묶이지 않음
     expect(await getAppPrice(292030)).toEqual(old);
@@ -225,9 +225,18 @@ describe("getAppPrice", () => {
 
   it("재조회 실패 시 stale 값을 반환한다 (첫 읽기에서 보관, N2)", async () => {
     const old: SteamPriceOverview = { ...witcher, final_formatted: "OLD" };
-    fakeCache.set("app:292030:price:KR", { data: old, fetchedAt: 1, isStale: true });
+    fakeCache.set("app:292030:price:KR", { data: old, fetchedAt: Date.now() - 2 * 60 * 60 * 1000, isStale: true });
     fetchMock.mockResolvedValueOnce(new Response("", { status: 503 }));
     expect(await run(getAppPrice(292030))).toEqual(old);
+  });
+
+  it("stale 값이 24시간을 넘었으면 fallback으로 쓰지 않는다 — 끝난 할인 방지 (/code-review 3차 #3)", async () => {
+    const old: SteamPriceOverview = { ...witcher, final_formatted: "OLD" };
+    fakeCache.set("app:292030:price:KR", { data: old, fetchedAt: Date.now() - 3 * 24 * 60 * 60 * 1000, isStale: true });
+    fetchMock.mockResolvedValueOnce(new Response("", { status: 503 }));
+    // 즉시 반환하지 않고 재조회를 기다린 뒤, 실패했으므로 미상
+    expect(await run(getAppPrice(292030))).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("미스 + 재조회 실패면 null", async () => {
@@ -324,6 +333,80 @@ describe("last-known 가격 / 대화형 조회 (작업 지시서 20261010_02)", 
     fakeCache.set("app:292030:info:KR", { data: { price_overview: witcher }, fetchedAt: Date.now() - 3 * DAY, isStale: false });
     fetchMock.mockResolvedValue(jsonResponse({ "292030": multi5["292030"] }));
     expect(await getAppPriceSnapshot(292030)).toBeNull();
+  });
+
+  it("success=false가 와도 실제 last-known 가격을 null로 덮지 않고 그 가격으로 fallback (/code-review 3차 #2)", async () => {
+    const at = Date.now() - 3 * 60 * 60 * 1000;
+    fakeLastKnown.set(292030, { price: witcher, fetchedAt: at });
+    fetchMock.mockResolvedValueOnce(jsonResponse({ "292030": { success: false } }));
+    const out = await run(getAppPricesBatch([292030]));
+    expect(fakeLastKnown.get(292030)).toEqual({ price: witcher, fetchedAt: at });
+    // 확인된 가격이 아니므로 fallback=true (커버리지 미포함)
+    expect(out.get(292030)).toEqual({ price: witcher, fetchedAt: at, fallback: true });
+    // 신선도 키도 null로 굳히지 않는다 — 다음 조회에서 다시 확인
+    expect(fakeCache.has("app:292030:price:KR")).toBe(false);
+  });
+
+  it("success=false + last-known 없음 → 판매 불가(null, 짧은 TTL), last-known은 기록하지 않음", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ "1": { success: false } }));
+    const out = await run(getAppPricesBatch([1]));
+    expect(out.get(1)?.price).toBeNull();
+    expect(out.get(1)?.fallback).toBeUndefined();
+    expect(cacheSetTtl.get("app:1:price:KR")).toBe(10 * 60 * 1000);
+    expect(fakeLastKnown.has(1)).toBe(false);
+  });
+
+  it("success=false + last-known도 판매 불가(null)면 판매 불가로 확정", async () => {
+    fakeLastKnown.set(1, { price: null, fetchedAt: Date.now() - 60_000 });
+    fetchMock.mockResolvedValueOnce(jsonResponse({ "1": { success: false } }));
+    const out = await run(getAppPricesBatch([1]));
+    expect(out.get(1)).toEqual({ price: null, fetchedAt: expect.any(Number) });
+  });
+});
+
+describe("store backoff 시간 기반 초기화 (/code-review 3차 #1)", () => {
+  const fetchMock = vi.fn<typeof fetch>();
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeCache.clear();
+    fakeLastKnown.clear();
+    resetAppDetailsBackoff();
+    resetPriceRefreshInFlight();
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("429 후 5분 동안 429가 없으면 backoff가 0으로 돌아간다 (성공 응답 없이도)", async () => {
+    fetchMock.mockResolvedValue(new Response("", { status: 429 }));
+    await run(getAppPricesBatch([1]));
+    expect(getAppDetailsBackoffMs()).toBeGreaterThan(0);
+    vi.setSystemTime(Date.now() + 4 * 60 * 1000);
+    expect(getAppDetailsBackoffMs()).toBeGreaterThan(0);
+    vi.setSystemTime(Date.now() + 60 * 1000 + 1);
+    expect(getAppDetailsBackoffMs()).toBe(0);
+  });
+
+  it("초기화 뒤 게임 페이지 미스는 대기 경로(재조회 대기)로 돌아간다", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("", { status: 429 }));
+    await run(getAppPricesBatch([1]));
+    vi.setSystemTime(Date.now() + 6 * 60 * 1000);
+    fetchMock.mockResolvedValueOnce(jsonResponse({ "292030": multi5["292030"] }));
+    // backoff 중이면 info 가격이 없어 null이 나왔을 경로 — 이제는 재조회를 기다려 실제 가격
+    expect(await run(getAppPrice(292030))).toEqual(witcher);
+  });
+
+  it("오래된 backoff 위에 새 429가 오면 누적하지 않고 처음부터 올린다", async () => {
+    fetchMock.mockResolvedValue(new Response("", { status: 429 }));
+    for (let i = 0; i < 6; i++) await run(getAppPricesBatch([1 + i]));
+    expect(getAppDetailsBackoffMs()).toBe(30_000);
+    vi.setSystemTime(Date.now() + 6 * 60 * 1000);
+    await run(getAppPricesBatch([99]));
+    expect(getAppDetailsBackoffMs()).toBe(5_000);
   });
 });
 

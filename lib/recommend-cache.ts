@@ -15,6 +15,7 @@
 
 import { getDb, getUserBySteamId } from "./db";
 import type { AnalyzeOptions, TasteProfile, Recommendation } from "./steam/profile";
+import { RERANK_OPTION_KEYS, type RerankPool } from "./recommend-rerank";
 
 /**
  * 캐시에 저장하는 payload. JSON 직렬화하여 TEXT 컬럼에 보관.
@@ -34,6 +35,14 @@ export interface RecommendationCachePayload {
    * undefined = 발굴을 요청하지 않았거나 결과가 없음(진행 중 이탈·실패). 구 row 파싱 호환.
    */
   storeDeals?: Recommendation[];
+  /**
+   * 재정렬 풀 (lib/recommend-rerank.ts). 캐시 키가 재정렬 옵션을 빼고 만들어지므로, 클라이언트는
+   * 이 풀로 현재 옵션(가성비·할인만·개수)의 목록을 다시 계산한다. 위 목록들은 저장 당시 요청 옵션
+   * 기준이며 풀이 없을 때의 fallback이다. 구 row에는 없다.
+   */
+  pool?: RerankPool;
+  /** 위시 가격 커버리지 부족 여부. 할인만 켬일 때 "할인 게임 없음" 대신 가격 실패 안내용. */
+  priceFetchFailed?: boolean;
 }
 
 export interface RecommendationCacheEntry {
@@ -69,7 +78,11 @@ export function hashOptions(input: CacheKeyInput): string {
   const opts = input.options;
   // Object.keys는 enumerable own properties만 반환. AnalyzeOptions의 모든 필드는
   // 평범한 데이터 속성이라 전부 포함된다. sort()로 키 순서에 의존하지 않게.
-  const optKeys = (Object.keys(opts) as Array<keyof AnalyzeOptions>).sort();
+  // 재정렬 옵션(가성비·할인만·개수)은 제외한다 — 결과에 재정렬 풀이 함께 저장되어 클라이언트가
+  // 그 옵션들의 목록을 다시 계산하므로, 키에 넣으면 그 옵션만 바꿔도 캐시가 빗나간다.
+  // (이 변경 이전 row는 키에 그 옵션이 있어 배포 후 한 번 miss된다 — 재분석이 덮어씀.)
+  const excluded = new Set<string>(RERANK_OPTION_KEYS);
+  const optKeys = (Object.keys(opts) as Array<keyof AnalyzeOptions>).filter(k => !excluded.has(k)).sort();
   const optsPart = optKeys
     .map(k => `${k}=${JSON.stringify(opts[k])}`)
     .join(",");

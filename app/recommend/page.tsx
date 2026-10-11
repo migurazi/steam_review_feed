@@ -12,10 +12,14 @@
  *   - libraryUnplayed=[] (분석 정상)   → 트랙 A 자리에 임계값 조정 권유
  *   - wishlist=[] (분석 정상)          → 트랙 B 자리에 매칭 없음 안내
  *
- * 옵션 변경 시 500ms debounce 후 SSE 재시작.
+ * 옵션 변경:
+ *   - 가성비·할인만·추천 개수: 서버 재요청 없이 재정렬 풀(lib/recommend-rerank.ts)로 즉시 다시 계산.
+ *     새로 블렌딩 대상이 된 후보의 리뷰 요약만 /api/recommend/reviews로 받아 한 번 더 계산한다.
+ *   - 할인 발굴 끄기: 섹션만 숨긴다. 켜기는 이번 분석에 발굴이 없었으면 재분석.
+ *   - 그 외(임계값·무료 제외·빠른 모드): 성향 자체가 바뀌므로 500ms debounce 후 SSE 재시작.
  */
 
-import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import ThemeToggle from '@/components/ThemeToggle';
@@ -32,6 +36,14 @@ import {
   type ReviewBadge,
 } from '@/lib/steam/profile';
 import { isPriceStale, formatRelativeTime, formatPriceAge } from '@/lib/price-display';
+import {
+  rerankFromPool,
+  RERANK_OPTION_KEYS,
+  shouldKeepPreviousWishlist,
+  withPreviousWishlist,
+  type RerankPool,
+} from '@/lib/recommend-rerank';
+import type { ReviewSummary } from '@/lib/steam/types';
 
 /**
  * 페이지 옵션 = 분석 옵션 + 트랙 선택.
@@ -66,12 +78,16 @@ interface ResultData {
   wishlist: Recommendation[] | null;
   storeDeals?: Recommendation[];
 }
-interface PartialResultData extends ResultData { loaded: number; total: number; }
+interface PartialResultData extends ResultData { loaded: number; total: number; pool?: RerankPool; }
+interface FinalResultData extends ResultData { pool?: RerankPool; priceFetchFailed?: boolean; }
 interface CachedData extends Omit<ResultData, 'wishlist'> {
   wishlist: Recommendation[];
   ownedGames: number;
   wishlistGames: number;
   wishlistFetchFailed: boolean;
+  /** 재정렬 풀. 구 캐시 row에는 없다. */
+  pool?: RerankPool;
+  priceFetchFailed?: boolean;
   /** 캐시가 마지막으로 저장된 시각 (Unix ms) */
   computedAt: number;
 }
@@ -106,6 +122,35 @@ function carryPrices(next: Recommendation[], prev: Recommendation[] | null): Rec
       ? { ...r, price: old.price, priceFetchedAt: old.priceFetchedAt }
       : r;
   });
+}
+
+/** 서버 재분석이 필요한 옵션 변경인지. 재정렬 옵션·발굴 끄기는 클라이언트에서 처리한다. */
+function needsServerRun(next: PageOptions, analyzed: PageOptions): boolean {
+  const rerankKeys = new Set<string>(RERANK_OPTION_KEYS);
+  for (const k of Object.keys(next) as (keyof PageOptions)[]) {
+    if (rerankKeys.has(k) || k === 'discoverDeals') continue;
+    if (next[k] !== analyzed[k]) return true;
+  }
+  // 발굴은 켤 때만 서버가 필요하다(이번 분석에 발굴 결과가 없으므로). 끄기는 섹션만 숨긴다.
+  return next.discoverDeals && !analyzed.discoverDeals;
+}
+
+/**
+ * partial-result의 풀을 이전 풀과 합친다.
+ *   - 리뷰는 누적 (이전 분석·캐시에서 받은 것도 재사용).
+ *   - 새 풀이 위시 가격 전(wishPricesReady=false)인데 이전 풀은 가격이 있으면, 이전 위시 풀을 유지한다
+ *     — 할인만 켬 상태에서 "가격 확인 중"으로 깜빡이지 않게 (기존 partial wishlist=null 처리와 같은 의도).
+ *   - 그 밖에는 새 풀의 위시에 이전 가격을 이어 붙이되, 1시간(PRICE_STALE_MS) 이내 가격만 붙인다.
+ *     풀의 가격은 표시뿐 아니라 할인만 필터·가성비 점수에도 쓰이므로, 며칠 묵은 캐시 가격을 붙이면
+ *     끝난 할인이 잠정 순위에 섞인다 (/code-review L1).
+ */
+function mergePartialPool(prev: RerankPool | null, next: RerankPool): RerankPool {
+  if (!prev) return next;
+  const reviews = { ...prev.reviews, ...next.reviews };
+  // 서버 poolForCache와 같은 규칙 (lib/recommend-rerank.ts).
+  if (shouldKeepPreviousWishlist(next, prev)) return withPreviousWishlist({ ...next, reviews }, prev);
+  const freshPrev = prev.wishlist.filter(r => r.priceFetchedAt !== undefined && !isPriceStale(r.priceFetchedAt));
+  return { ...next, wishlist: carryPrices(next.wishlist, freshPrev), reviews };
 }
 
 function buildUrl(opts: PageOptions): string {
@@ -152,6 +197,10 @@ function RecommendContent() {
   const [storeDealsStatus, setStoreDealsStatus] = useState({ failed: false, truncated: false });
   const [progress, setProgress] = useState<ProgressData | null>(null);
   const [result, setResult] = useState<ResultData | null>(null);
+  // 재정렬 풀. 있으면 화면 목록은 풀 + 현재 옵션으로 계산한다(result의 목록은 fallback).
+  const [pool, setPool] = useState<RerankPool | null>(null);
+  // 위시 가격 커버리지 부족 (result·cached에서). done보다 먼저 알아야 할인만 안내가 맞게 나온다.
+  const [priceFetchFailed, setPriceFetchFailed] = useState(false);
   // 분석이 아직 진행 중이고 result가 partial-result에서 온 잠정 결과일 때 true.
   // 최종 'result' 이벤트가 도착하면 false로 전환. 옵션 변경/재분석 시 다시 true.
   const [isProvisional, setIsProvisional] = useState(false);
@@ -160,6 +209,10 @@ function RecommendContent() {
   const [cachedAt, setCachedAt] = useState<number | null>(null);
   const [doneData, setDoneData] = useState<DoneData | null>(null);
   const [loading, setLoading] = useState(true);
+  // 서버가 라이브러리·위시 리뷰 조회를 끝냈는지 (최종 'result' 수신). 발굴 단계(result 이후, 최대 120초)
+  // 동안 loading은 계속 true지만 그 단계는 라이브러리·위시 리뷰를 받지 않으므로, 재정렬용 리뷰 보충은
+  // 이 값으로 시작한다 (/code-review 5차 #6).
+  const [mainResultReceived, setMainResultReceived] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [displayName, setDisplayName] = useState<string | null>(null);
   const [steamId, setSteamId] = useState<string | null>(null);
@@ -168,6 +221,12 @@ function RecommendContent() {
 
   const esRef = useRef<EventSource | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 콜백에서 최신 값을 읽기 위한 ref (handleOptionsChange는 재생성하지 않는다).
+  const analyzedOptionsRef = useRef<PageOptions>(DEFAULT_OPTIONS);
+  // 재정렬용 리뷰 요약을 이미 요청한 appid (아래 effect). 새 서버 분석 시작 시 비운다.
+  const requestedReviewIdsRef = useRef<Set<number>>(new Set());
+  const poolRef = useRef<RerankPool | null>(null);
+  useEffect(() => { poolRef.current = pool; }, [pool]);
 
   // 인증 확인 — 비로그인 시 홈 리다이렉트
   useEffect(() => {
@@ -188,12 +247,16 @@ function RecommendContent() {
   // SSE 시작 (debounce)
   const startAnalysis = useCallback((opts: PageOptions) => {
     setAnalyzedOptions(opts);
+    analyzedOptionsRef.current = opts;
+    requestedReviewIdsRef.current.clear();
     if (esRef.current) {
       esRef.current.close();
       esRef.current = null;
     }
     setProgress(null);
     setResult(null);
+    setPool(null);
+    setPriceFetchFailed(false);
     setStoreDealsFresh(false);
     setStoreDealsStatus({ failed: false, truncated: false });
     setIsProvisional(false);
@@ -201,6 +264,7 @@ function RecommendContent() {
     setDoneData(null);
     setError(null);
     setLoading(true);
+    setMainResultReceived(false);
 
     const es = new EventSource(buildUrl(opts));
     esRef.current = es;
@@ -220,6 +284,8 @@ function RecommendContent() {
           wishlist: data.wishlist,
           storeDeals: data.storeDeals,
         });
+        setPool(data.pool ?? null);
+        setPriceFetchFailed(!!data.priceFetchFailed);
         // doneData를 함께 채워 ResultView가 doneData 분기를 통과하도록 한다.
         // 계약 (producer = lib/recommend route의 tryWriteCache 헬퍼):
         //   - cache는 profile.analyzedGames > 0 AND (genres ∪ categories ≠ ∅)
@@ -237,6 +303,7 @@ function RecommendContent() {
           analysisInsufficient: false,
           metaMissingDominant: false,
           libraryFetchFailed: false,
+          priceFetchFailed: !!data.priceFetchFailed,
         });
         setCachedAt(data.computedAt);
       } catch { /* ignore */ }
@@ -245,8 +312,9 @@ function RecommendContent() {
     // 이번 분석의 결과가 아니므로 storeDealsFresh는 건드리지 않는다.
     es.addEventListener('cached-store-deals', (e: MessageEvent) => {
       try {
-        const data = JSON.parse(e.data) as { storeDeals: Recommendation[] };
+        const data = JSON.parse(e.data) as { storeDeals: Recommendation[]; poolStoreDeals?: Recommendation[] };
         setResult(prev => (prev ? { ...prev, storeDeals: data.storeDeals } : prev));
+        setPool(prev => (prev ? { ...prev, storeDeals: data.poolStoreDeals } : prev));
       } catch { /* ignore */ }
     });
     // 잠정 결과: fetch가 진행되는 동안 ~3초 간격으로 들어온다.
@@ -265,6 +333,11 @@ function RecommendContent() {
           // partial에는 발굴 결과가 없다 — 캐시에서 온 이전 발굴 결과를 유지한다.
           storeDeals: prev?.storeDeals,
         }));
+        // 풀: 발굴 풀은 partial에 없으므로 이전 것(캐시)을 유지한다.
+        if (data.pool) {
+          const nextPool = data.pool;
+          setPool(prev => ({ ...mergePartialPool(prev, nextPool), storeDeals: prev?.storeDeals }));
+        }
         setIsProvisional(true);
         // 새 분석의 첫 partial이 도착하면 캐시 표시는 의미를 잃는다.
         setCachedAt(null);
@@ -272,12 +345,28 @@ function RecommendContent() {
     });
     es.addEventListener('result', (e: MessageEvent) => {
       try {
-        const data = JSON.parse(e.data) as ResultData;
+        const data = JSON.parse(e.data) as FinalResultData;
         // result는 라이브러리·위시 트랙만 담는다. 발굴 결과는 뒤이은 store-deals 이벤트가
         // 채우므로 그 전까지 이전(캐시) 발굴 결과를 유지한다.
-        setResult(prev => ({ ...data, storeDeals: prev?.storeDeals }));
+        setResult(prev => ({
+          profile: data.profile,
+          libraryUnplayed: data.libraryUnplayed,
+          wishlist: data.wishlist,
+          storeDeals: prev?.storeDeals,
+        }));
+        if (data.pool) {
+          const finalPool = data.pool;
+          // 리뷰는 누적(이전 풀의 것도 재사용), 발굴 풀은 store-deals 전까지 이전 것 유지.
+          setPool(prev => ({
+            ...finalPool,
+            reviews: { ...(prev?.reviews ?? {}), ...finalPool.reviews },
+            storeDeals: prev?.storeDeals,
+          }));
+        }
+        setPriceFetchFailed(!!data.priceFetchFailed);
         setIsProvisional(false);
         setCachedAt(null);
+        setMainResultReceived(true);
       } catch { /* ignore */ }
     });
     // 발굴 트랙 확정 (tracks.deal일 때만, result 이후 · done 이전).
@@ -289,12 +378,23 @@ function RecommendContent() {
           truncated?: boolean;
           /** failed일 때만: 현재 라이브러리·위시리스트로 다시 거른 이전 발굴 결과. */
           previous?: Recommendation[];
+          /** 재정렬용 발굴 shortlist와 그 리뷰 (성공 시). */
+          pool?: Recommendation[];
+          reviews?: Record<number, ReviewSummary | null>;
+          /** failed일 때만: 이전 발굴 풀. */
+          previousPool?: Recommendation[];
+          previousReviews?: Record<number, ReviewSummary | null>;
         };
         const failed = !!data.failed;
         // 실패면 서버가 다시 거른 이전 결과를 "이전 결과 표시" 안내와 함께 보여준다.
         // (cached로 받은 목록을 그대로 두면 그 사이 구매·위시 추가한 게임이 남는다)
         const next = failed ? data.previous : data.storeDeals;
         setResult(prev => (prev ? { ...prev, storeDeals: next } : prev));
+        const nextPoolDeals = failed ? data.previousPool : data.pool;
+        const nextReviews = (failed ? data.previousReviews : data.reviews) ?? {};
+        setPool(prev => (prev
+          ? { ...prev, storeDeals: nextPoolDeals, reviews: { ...prev.reviews, ...nextReviews } }
+          : prev));
         setStoreDealsStatus({ failed, truncated: !!data.truncated });
         setStoreDealsFresh(true);
       } catch { /* ignore */ }
@@ -339,9 +439,82 @@ function RecommendContent() {
   // 옵션 변경 → debounce → 재시작
   const handleOptionsChange = useCallback((next: PageOptions) => {
     setOptions(next);
+    // 재정렬만으로 되는 변경이면 서버를 부르지 않는다 — 화면은 useMemo(displayed)가 즉시 다시 계산.
+    // 판단은 항상 "최신 옵션 vs 분석한 옵션"이다. 서버가 필요하면 최신 옵션으로 (다시) 예약한다.
+    // 풀이 없으면(구 캐시 결과·오류 등) 재정렬할 근거가 없으므로 서버로 간다. 단 분석이 진행 중이면
+    // 곧 풀이 도착하므로 기다린다 — 첫 이벤트 전 토글마다 분석을 처음부터 다시 하지 않도록 (/code-review L2).
+    const serverRun = needsServerRun(next, analyzedOptionsRef.current)
+      || (poolRef.current === null && esRef.current === null);
+    if (!serverRun) {
+      // 예약된 재분석이 있으면 취소한다 — 서버 옵션을 바꿨다가 500ms 안에 되돌린 경우 등. 최신 옵션은
+      // 분석한 옵션과 서버 관점에서 같으므로 재정렬만으로 충분하다 (/code-review 5차 #4).
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current);
+        debounceRef.current = null;
+      }
+      return;
+    }
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => startAnalysis(next), 500);
+    debounceRef.current = setTimeout(() => {
+      debounceRef.current = null;
+      startAnalysis(next);
+    }, 500);
   }, [startAnalysis]);
+
+  // 화면 목록: 풀이 있으면 현재 옵션으로 재정렬, 없으면 서버 목록 그대로.
+  const displayed = useMemo<{ result: ResultData; missingReviewIds: number[] } | null>(() => {
+    if (!result) return null;
+    if (!pool) return { result, missingReviewIds: [] };
+    const r = rerankFromPool(pool, options);
+    return {
+      result: {
+        profile: result.profile,
+        libraryUnplayed: r.libraryUnplayed,
+        wishlist: r.wishlist,
+        // 발굴 풀이 없으면(구 캐시·발굴 전) 서버 목록을 쓴다.
+        storeDeals: r.storeDeals ?? result.storeDeals,
+      },
+      missingReviewIds: r.missingReviewIds,
+    };
+  }, [result, pool, options]);
+
+  // 재정렬로 새로 블렌딩 대상이 된 후보의 리뷰 요약 받기. 분석 중에는 서버가 받는 중일 수 있어
+  // 기다리고, 최종 result(서버 리뷰 조회 완료) 또는 분석 종료 뒤 한 번에 요청한다. 이미 요청한 appid는 다시 묻지 않는다(실패 포함 — 응답이
+  // null로 채워져 중립 0.5로 계산됨).
+  //
+  // 요청 표시(requestedReviewIdsRef)는 응답을 받아 풀에 반영했을 때만 남긴다. abort·실패·non-ok면
+  // 즉시(cleanup·then 안에서) 지워, 다음 effect 실행이 그 appid를 다시 요청할 수 있게 한다
+  // (/code-review M5 — 예전에는 catch가 늦게 지워 다음 실행이 건너뛴 뒤 다시 실행되지 않았다).
+  // 새 서버 분석이 시작되면 startAnalysis가 비운다.
+  const missingKey = displayed?.missingReviewIds.join(',') ?? '';
+  // 하나의 값으로 묶어 의존성에 둔다 — loading과 mainResultReceived를 따로 두면 result 직후 done으로
+  // loading만 바뀔 때 진행 중인 요청을 취소하고 같은 요청을 다시 보낸다 (/code-review 5차 재검토 L4).
+  const reviewsReady = !loading || mainResultReceived;
+  useEffect(() => {
+    if (!reviewsReady || !missingKey) return;
+    const ids = missingKey.split(',').map(Number).filter(id => !requestedReviewIdsRef.current.has(id)).slice(0, 60);
+    if (ids.length === 0) return;
+    for (const id of ids) requestedReviewIdsRef.current.add(id);
+    const ctrl = new AbortController();
+    let settled = false;
+    const release = () => { for (const id of ids) requestedReviewIdsRef.current.delete(id); };
+    fetch(`/api/recommend/reviews?ids=${ids.join(',')}`, { signal: ctrl.signal })
+      .then(res => (res.ok ? res.json() : null))
+      .then((data: { summaries?: Record<number, ReviewSummary | null> } | null) => {
+        settled = true;
+        const summaries = data?.summaries;
+        if (!summaries) { release(); return; }
+        // 응답에 빠진 appid는 null(조회 실패)로 채워 중립 0.5로 확정한다 — 같은 실패를 반복 요청하지 않도록.
+        const filled: Record<number, ReviewSummary | null> = {};
+        for (const id of ids) filled[id] = summaries[id] ?? null;
+        setPool(prev => (prev ? { ...prev, reviews: { ...prev.reviews, ...filled } } : prev));
+      })
+      .catch(() => { settled = true; release(); });
+    return () => {
+      if (!settled) release();
+      ctrl.abort();
+    };
+  }, [reviewsReady, missingKey]);
 
   // 언마운트 시 정리
   useEffect(() => () => {
@@ -444,11 +617,23 @@ function RecommendContent() {
             캐시 hit인 경우 cached 이벤트에서 placeholder doneData가 채워져 있다.
             libraryFetchFailed가 true여도 cached result는 그대로 보여준다 — 사용자가
             오프라인/일시적 오류 상황에서 이전 결과로 의사결정을 계속할 수 있도록. */}
-        {result && (
+        {displayed && (
           <ResultView
-            result={result}
-            doneData={doneData}
-            options={analyzedOptions}
+            result={displayed.result}
+            // 가격 실패 여부는 화면 목록을 만든 풀에서 계산한다 — 캐시에서 온 doneData가 done 전까지 남아
+            // 새 결과와 어긋난 안내를 띄우지 않도록 (/code-review M2). 풀이 없을 때만 이벤트 값을 쓴다.
+            doneData={doneData ? {
+              ...doneData,
+              priceFetchFailed: pool ? pool.wishPricesReady && !pool.wishPriceOk : (doneData.priceFetchFailed || priceFetchFailed),
+            } : null}
+            // 재정렬 옵션·발굴 끄기는 현재 옵션을 따르고(즉시 반영), 나머지 문구는 분석 옵션을 따른다.
+            options={{
+              ...analyzedOptions,
+              valueWeighting: options.valueWeighting,
+              saleOnly: options.saleOnly,
+              maxRecommendationsPerTrack: options.maxRecommendationsPerTrack,
+              discoverDeals: analyzedOptions.discoverDeals && options.discoverDeals,
+            }}
             isProvisional={isProvisional}
             cachedAt={cachedAt}
             discovering={loading && !storeDealsFresh}
@@ -755,6 +940,43 @@ function TasteRow({ title, entries }: { title: string; entries: TasteProfile['ge
 // 트랙 섹션
 // ============================================================================
 
+/** 제목 버튼으로 내용을 접고 펼치는 추천 트랙 섹션. 기본은 펼침. */
+function CollapsibleSection({
+  title, count, children,
+}: {
+  title: string; count: number; children: ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  return (
+    <section className="space-y-3">
+      <h2>
+        <button
+          type="button"
+          onClick={() => setExpanded(v => !v)}
+          aria-expanded={expanded}
+          className="group flex w-full items-center gap-1.5 text-left text-sm font-semibold text-gray-700 dark:text-gray-200 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] transition-colors"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 16 16"
+            fill="currentColor"
+            aria-hidden
+            className={`w-4 h-4 shrink-0 text-gray-400 dark:text-gray-500 group-hover:text-current transition-transform duration-200 ${expanded ? '' : '-rotate-90'}`}
+          >
+            <path
+              fillRule="evenodd"
+              d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z"
+              clipRule="evenodd"
+            />
+          </svg>
+          <span>{title} {count > 0 ? `(${count})` : ''}</span>
+        </button>
+      </h2>
+      {expanded && children}
+    </section>
+  );
+}
+
 function TrackSection({
   title, recs, emptyMessage, isProvisional,
 }: {
@@ -765,10 +987,7 @@ function TrackSection({
     ? '잠정 결과를 기다리는 중입니다. 메타 정보가 더 도착하면 후보가 나타납니다.'
     : emptyMessage;
   return (
-    <section className="space-y-3">
-      <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200">
-        {title} {recs.length > 0 ? `(${recs.length})` : ''}
-      </h2>
+    <CollapsibleSection title={title} count={recs.length}>
       {recs.length === 0 ? (
         <p className="text-sm text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/50 rounded-lg p-4">
           {displayedEmpty}
@@ -778,7 +997,7 @@ function TrackSection({
           {recs.map(r => <RecommendCard key={r.appid} rec={r} />)}
         </div>
       )}
-    </section>
+    </CollapsibleSection>
   );
 }
 
@@ -808,10 +1027,10 @@ function WishlistSection({
     emptyMessage = '위시리스트에서 성향과 일치하는 게임을 찾지 못했습니다.';
   }
   return (
-    <section className="space-y-3">
-      <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200">
-        {saleOnly ? '위시리스트 중 할인 중이고 성향에 맞는 게임' : '위시리스트 중 성향에 맞는 게임'} {recs.length > 0 ? `(${recs.length})` : ''}
-      </h2>
+    <CollapsibleSection
+      title={saleOnly ? '위시리스트 중 할인 중이고 성향에 맞는 게임' : '위시리스트 중 성향에 맞는 게임'}
+      count={recs.length}
+    >
       {/* 결과가 있는데 가격 조회가 실패한 경우: 가성비 반영 없이 기존 순위임을 알린다. */}
       {!isProvisional && valueWeighting && priceFetchFailed && recs.length > 0 && (
         <p className="text-xs text-amber-700 dark:text-amber-400">
@@ -827,7 +1046,7 @@ function WishlistSection({
           {recs.map(r => <RecommendCard key={r.appid} rec={r} />)}
         </div>
       )}
-    </section>
+    </CollapsibleSection>
   );
 }
 
@@ -861,10 +1080,7 @@ function StoreDealSection({
     emptyMessage = '취향에 맞는 할인 게임이 없습니다.';
   }
   return (
-    <section className="space-y-3">
-      <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-200">
-        취향 맞는 할인 게임 {list.length > 0 ? `(${list.length})` : ''}
-      </h2>
+    <CollapsibleSection title="취향 맞는 할인 게임" count={list.length}>
       {list.length > 0 && discovering && (
         <p className="text-xs text-gray-500 dark:text-gray-400">이전 결과입니다. 새로 찾는 중…</p>
       )}
@@ -883,7 +1099,7 @@ function StoreDealSection({
           {list.map(r => <RecommendCard key={r.appid} rec={r} />)}
         </div>
       )}
-    </section>
+    </CollapsibleSection>
   );
 }
 

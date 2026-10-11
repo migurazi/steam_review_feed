@@ -10,6 +10,7 @@ import fs from "fs";
 import path from "path";
 import {
   parseSearchResultAppIds,
+  countSearchResultRows,
   storeItemToPrice,
   storeItemToReviewSummary,
   normalizeStoreItem,
@@ -76,6 +77,28 @@ function summary(appid: number, price: SteamPriceOverview | null, reviews: numbe
 // ============================================================================
 // 검색 HTML 파서
 // ============================================================================
+
+describe("countSearchResultRows", () => {
+  it("패키지·번들·다중 앱 행까지 모두 센다", () => {
+    const html = '<a data-ds-appid="10">a</a><a data-ds-packageid="1" data-ds-appid="4700,4780">p</a>'
+      + '<a data-ds-bundleid="2" data-ds-appid="20">b</a>';
+    expect(countSearchResultRows(html)).toBe(3);
+    expect(parseSearchResultAppIds(html)).toEqual([10]);
+  });
+
+  it("data-ds-appid가 없는 번들 행(번들 id·행 클래스만)도 센다 — 번들만 있는 페이지에서 순회가 멈추지 않게", () => {
+    const html = '<a href="x" data-ds-bundleid="7" class="search_result_row ds_collapse_flag">b</a>'
+      + '<a href="y" class="search_result_row">c</a><a href="z" class="other">not a row</a>';
+    expect(countSearchResultRows(html)).toBe(2);
+    expect(parseSearchResultAppIds(html)).toEqual([]);
+  });
+
+  it("빈·비문자열 입력은 0", () => {
+    expect(countSearchResultRows("")).toBe(0);
+    expect(countSearchResultRows("<div>no rows</div>")).toBe(0);
+    expect(countSearchResultRows(undefined as unknown as string)).toBe(0);
+  });
+});
 
 describe("parseSearchResultAppIds", () => {
   it("실응답 첫 페이지에서 appid를 순서대로 추출한다 (V3·V4 픽스처)", () => {

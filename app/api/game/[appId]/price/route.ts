@@ -28,8 +28,10 @@ export async function GET(
   }
 
   // is_free / release_date는 appInfo 캐시에서 확인. 캐시 미스면 getAppDetails 호출.
-  // 가격보다 먼저 한다 — getAppDetails의 신규 조회는 가격 캐시도 함께 채우므로, 이어지는
-  // getAppPrice가 캐시 히트가 되어 store 호출이 한 번으로 끝난다.
+  // 가격보다 먼저 한다 — getAppDetails가 store를 새로 조회한 경우에는 가격 캐시도 함께 채우므로,
+  // 이어지는 getAppPriceSnapshot이 캐시 히트가 되어 store 호출이 한 번으로 끝난다.
+  // 단, SQLite 영속 캐시에서 hydrate한 경우(재시작 직후 흔함)는 price_overview를 뺀 채 저장돼
+  // 있어 가격 캐시를 채우지 않는다 — 그때는 getAppPriceSnapshot이 따로 store를 조회한다.
   let cachedInfo = cacheGet<SteamAppDetails>(`app:${appId}:info:KR`)?.data;
   if (!cachedInfo) {
     const details = await getAppDetails(appId);
