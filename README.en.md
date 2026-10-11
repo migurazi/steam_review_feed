@@ -13,7 +13,7 @@ A service that aggregates the latest reviews from your Steam Wishlist and Librar
 ## Key Features
 
 - **Unified Review Feed** — View the latest reviews from Wishlist & Library games in one place
-- **Taste Analysis + Recommendations** (`/recommend`) — Extracts genre/category signals from your library playtime and recommends games in two tracks (library-unplayed / wishlist). Card-farming short plays are filtered by a user-adjustable threshold
+- **Taste Analysis + Recommendations** (`/recommend`) — Extracts genre/category signals from your library playtime and recommends games in two tracks (library-unplayed / wishlist). Matching uses **cosine similarity**, and the ranking blends in **review scores** (with a review badge on each card). Card-farming short plays are filtered by a user-adjustable threshold. Wishlist cards show current prices, with optional **value-for-money ranking** (discount appeal) and an "on sale only" filter. An optional **store deal discovery** track recommends discounted games you don't own that match your taste. Value, on-sale-only and result count re-rank **instantly on the client** without re-running the analysis; result sections are collapsible
 - **Achievements Dashboard** (`/achievements`) — Scans your whole library's achievement progress via SSE, sorted by completion. Expand a game for its per-achievement list (icon / global rarity / unlock time), a collapse-all control, and change alerts when a game's achievement schema is updated (added / removed / perfect-broken)
 - **Self-Hosting Setup Wizard** — On first launch with no Steam API key, register it through the `/setup` screen in the browser (saved to `.env.local`) — no manual file editing
 - **Steam Login** — Steam OpenID authentication or direct Steam ID input
@@ -32,7 +32,7 @@ A service that aggregates the latest reviews from your Steam Wishlist and Librar
 | Styling | Tailwind CSS 4 (class-based dark mode) |
 | DB | SQLite (better-sqlite3) — user/game list persistence |
 | Session | iron-session (signed cookies) |
-| Cache | lru-cache (in-memory) |
+| Cache | lru-cache (in-memory) + SQLite persistent cache (game metadata, recommendation results) |
 | Auth | Steam OpenID |
 | Video | hls.js (HLS streaming) |
 | Testing | Vitest (257 tests) |
@@ -178,6 +178,27 @@ Pipeline: `develop`/`main` push -> Docker image build -> GitLab Registry push ->
 | `npm run start:standalone` | Standalone server (auto-loads .env.local) |
 | `npm run lint` | ESLint check |
 | `npm test` | Run Vitest tests |
+
+## Performance / Cache
+
+### Analysis speed and Steam calls (`/recommend`)
+
+Game metadata for taste analysis is fetched from the official API host's **`IStoreBrowseService/GetItems`** (no key needed), **100 games per call**. One response carries genres (genre tags), categories, release status, header image, review summary and price, so metadata, wishlist prices and review scores share one cache.
+
+- Speed: ~0.3 s per call with 0.5 s between calls — an uncached 5,000-game library takes about a minute (the previous per-game `appdetails` path at 1.5 s each took ~2 hours).
+- Traffic: only the needed fields, ~2–3 KB per game (`appdetails` was 20 KB+).
+- Genres are the Steam genre tags (Action, RPG, ...) among the game's top user tags. Category names come from `GetStoreCategories`.
+- Prices: only single-game purchase options are used (bundle prices are ignored). Wishlist games whose cheapest option is bundle-only get their single-game price from `appdetails` (skipped during a store 429 backoff). 100%-off giveaways are not treated as free-to-play. If a price lookup fails, the last price seen within 24 hours is shown greyed out.
+- Deal discovery's candidate list (store search) and the game detail page's price refresh still use the store host.
+
+### Cache
+
+- Game metadata: in-memory LRU + **SQLite persistent cache** (`store_meta_cache`, 7 days), reused across re-analysis and server restarts. During a GetItems outage, expired metadata (even older than 7 days) is used so the analysis can still run.
+- Prices 1 hour (+ last-known price 24 hours), review summaries 6 hours (1 hour for "no reviews").
+- Two in-memory caches: a general one (10,000 entries) and a per-game one for metadata / review summaries / prices (60,000 entries), so a large first analysis doesn't evict other users' cache.
+- Results are stored in `recommendation_cache` and shown instantly on the next visit, together with a re-ranking pool so value / on-sale-only / count changes need no re-analysis (they're also excluded from the cache key).
+- Closing the tab mid-analysis keeps partial results gathered up to ~30 seconds earlier.
+- **Fast mode** caps the metadata lookups (unplayed candidates / taste sample) to reduce work on very large libraries.
 
 ## Troubleshooting
 

@@ -22,8 +22,8 @@
   - `progress` / `result` / `done` 이벤트 (선례 reviews/stream의 cancel 패턴 차용)
   - `done` 플래그: `libraryFetchFailed`, `wishlistFetchFailed`,
     `analysisInsufficient`, `metaMissingDominant` — 클라이언트가 7가지 빈 상태 분기
-- **`getAppDetailsBatch` 헬퍼** — `STREAM_CONCURRENCY` 단위 병렬 메타 일괄 조회 +
-  `isCancelled` 즉시 반영 (라이브러리/위시리스트 합산 유니크 appid 처리)
+- **메타 일괄 조회 헬퍼** — 라이브러리/위시리스트 합산 유니크 appid, `isCancelled` 즉시 반영
+  (처음 `getAppDetailsBatch`로 도입, 이후 GetItems 기반 `getStoreMetaBatch`로 대체)
 - **타입 확장** — `SteamGenre`, `SteamCategory` + `SteamAppDetails.genres/categories` 옵셔널 필드
 - **도전과제 대시보드** (`/achievements`) — 라이브러리 전체의 도전과제 달성 현황을
   SSE로 스캔하여 완주율순으로 표시 (Phase 0–3)
@@ -44,24 +44,71 @@
   - `lib/app-root.ts` — standalone 서버가 `.next/standalone`으로 chdir 하는 문제를
     피해 `INIT_CWD` 기반으로 프로젝트 루트를 찾아 DB/로그/`.env.local` 경로 고정
 - **단위 테스트** — 도전과제 diff/store/scan + app-root 등 커버리지 추가.
-  128 → **257 테스트** (22개 파일)
+  128 → 257 → **408 테스트** (30개 파일, 가성비·재정렬·GetItems 메타·캐시 분리 테스트 포함)
+
+- **가성비·할인 추천** (`/recommend`) — 위시리스트 카드에 현재 가격 표시, 할인 매력도
+  블렌딩(취향·호평·할인), "할인 중인 게임만" 필터. 가격 조회 실패 시 24시간 이내 마지막 가격을
+  회색 + "N시간 전 가격"으로 표시
+- **미보유 할인 게임 발굴** 트랙 (옵션) — 스토어 할인 게임 중 라이브러리·위시리스트에 없고 취향에
+  맞으며 리뷰 10개 이상인 게임 추천 (시간 예산 120초)
+- **즉시 재정렬** — 가성비·할인만·추천 개수 변경은 서버 재분석 없이 클라이언트가 재정렬
+  (`lib/recommend-rerank.ts`). 서버가 후보 풀(라이브러리·위시·발굴 + 리뷰 요약)을 내려주고 결과
+  캐시에도 저장. 세 옵션은 캐시 키에서 제외. 풀 밖 리뷰는 `GET /api/recommend/reviews`로 보충
+- `/recommend` 결과 섹션(라이브러리·위시리스트·할인 발굴) 접기/펼치기
 
 ### Changed
 
+- **성향 분석 메타 조회를 GetItems 배치로 전환** — 게임마다 `appdetails`(store 호스트, 1.5초
+  직렬)를 부르던 것을 `IStoreBrowseService/GetItems` 100개/호출로 교체 (`getStoreMetaBatch`).
+  미캐시 5,000개 라이브러리 첫 분석 약 2시간 → 1분 안팎, 게임당 응답 20KB+ → 2–3KB
+  - 장르는 상위 사용자 태그 중 Steam 장르 태그로 산출 (`lib/steam/store-meta.ts`), 카테고리 이름은
+    `GetStoreCategories`. 영속 캐시는 새 테이블 `store_meta_cache` (기존 캐시는 1회 재조회)
+  - 같은 응답으로 리뷰 요약·스토어 요약·가격·`app_meta`(이름·헤더 이미지) 캐시를 함께 채움.
+    리뷰 호평률은 appreviews 개별 호출 대신 GetItems 요약 사용 (호평률 ±1%p 차이 가능)
+  - 위시리스트 가격도 GetItems로 조회 (`getStoreItemPricesBatch`). 결과 계약은 기존 가격 배치와 동일
+- 할인 발굴 후보 메타도 GetItems 배치 사용
+- partial 결과 캐시 쓰기를 30초 간격으로 제한 (이전 3초). partial-result 중복 판단은 목록 모양만 비교하고
+  재정렬 풀은 30초 간격으로 별도 전송
+- 인메모리 캐시 분리 — 게임 단위 키(`storemeta:`·`reviewsummary:`·`storeitem:`·`app:{id}:price:`)는
+  전용 LRU(60,000)로, 일반 LRU(10,000)는 그 밖의 키만. 대형 라이브러리 첫 분석이 같은 분석의 리뷰·가격과
+  다른 사용자 캐시를 밀어내던 문제 해소
+- 조기 위시 단계에서 라이브러리 분석(성향 계산)을 한 번만 하고 재사용 (이전 3회)
 - `/feed` 헤더에 "성향 분석" 진입점 링크 추가
 - `EventType`에 `recommend_analyze` 추가 (`lib/logger.ts`)
 - 상단 네비게이션(`AppNav`)에 도전과제 탭 추가
 - DB/로그/`.env.local` 경로를 `lib/app-root.ts`의 `APP_ROOT` 기준으로 통일
   (standalone 실행 시 데이터가 `.next/standalone` 하위로 흩어지던 문제 해소)
 
+### Fixed
+
+- GetItems `is_free`가 100% 할인 배포(한정 무료)에도 true라 무료 게임으로 분류되던 문제 —
+  F2P와 구분 (`storeItemIsFreeToPlay`)
+- 묶음 패키지 가격이 게임 가격으로 캐시·표시되던 문제, 구매 옵션 없는 유료 게임 응답이 마지막
+  가격(last-known)을 지우던 문제 (`storeItemPriceIsAppPrice`)
+- 카테고리 이름 조회 실패 시 "카테고리 {id}" 라벨이 7일간 영속 저장되던 문제
+- 리뷰 없는 게임(출시 예정 등)을 분석마다 다시 조회하던 문제 — "리뷰 없음"을 1시간 캐시
+- 번들 행만 있는 할인 검색 페이지에서 후보 순회가 멈추던 문제
+- 가격 조회 `success:false`(판매 불가)가 마지막 가격을 덮어쓰던 문제, 24시간 넘은 묵은 가격이
+  fallback으로 쓰이던 문제, 429 backoff가 장시간 유휴 후에도 남던 문제
+- 최저 구매 옵션이 묶음뿐인 게임이 "판매 불가"로 기록되던 문제 — 위시 가격은 appdetails로 단품 가격 보충
+- GetItems 장애 시 메타가 전부 없어 "분석 불가"가 되던 문제 — 만료된 이전 메타로 fallback
+- 카테고리 이름 재조회가 한 번 실패하면 이후 계속 이름 없이 동작하던 문제 (이전 값 재캐시, 동시 조회 공유)
+- 분석 도중 탭을 닫으면 마지막 partial이 저장되지 않을 수 있던 문제
+- 옵션을 바꿨다가 500ms 안에 되돌려도 전체 재분석이 시작되던 문제
+- 할인 발굴 진행 중(최대 120초) 재정렬 리뷰 보충이 멈춰 있던 문제
+- 할인 후보 메타 진행률이 "0/40"에 머물던 문제
+
 ### Notes
 
 - `W_CAT` 기본값은 단계 0 사전 측정 결과(장르 엔트로피 2.962 ≥ 2.5)에 따라
   조정 룰 적용으로 0.5 → **0.3** 하향. 자세한 측정 데이터는 작업 지시서
   부록 A (`docs/20260527_01_profile_analysis_recommendation.md`) 참조.
-- 라이브러리 5,000+ 사용자는 Steam appdetails 비공식 API Rate Limit으로
-  첫 분석 완주가 어려울 수 있음 (R11). UI에 안내 노출. 후속에서 적응형
-  동시성 검토 예정.
+- (해소) 라이브러리 5,000+ 사용자의 첫 분석이 appdetails Rate Limit으로 오래 걸리던 문제(R11)는
+  GetItems 배치 전환으로 해소.
+- 장르 id 체계가 appdetails 장르 id에서 태그 id로 바뀜 — 성향 프로필은 매 분석 새로 계산하므로
+  영향 없음. 태그는 사용자 투표 기반이라 appdetails 장르와 일부 다를 수 있음.
+- 게임 상세 화면 가격(appdetails 기본 패키지)과 추천 가격(GetItems 최저 단일 게임 옵션)이 같은 가격
+  캐시를 써서, 두 가격이 다른 드문 경우 마지막으로 조회한 쪽이 표시됨.
 
 ## [0.3.0] - 2026-03-28
 
