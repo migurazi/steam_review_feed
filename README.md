@@ -6,16 +6,17 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 
 ## 스크린샷
 
-| 홈 화면 | 리뷰 피드 |
-|---------|-----------|
-| ![홈 화면](docs/screenshots/home.png) | ![리뷰 피드](docs/screenshots/feed.png) |
+| 홈 화면 | 리뷰 피드 | 번들 차트 메이커 |
+|---------|-----------|------------------|
+| [![홈 화면](docs/screenshots/home.png)](docs/screenshots/home.png) | [![리뷰 피드](docs/screenshots/feed.png)](docs/screenshots/feed.png) | [![번들 차트 메이커](docs/screenshots/bundle.png)](docs/screenshots/bundle.png) |
 
 ## 주요 기능
 
 - **통합 리뷰 피드** — 위시리스트·라이브러리 게임의 최신 리뷰를 한 화면에서 확인
 - **성향 분석 + 보유 게임 추천** (`/recommend`) — 라이브러리 플레이타임에서 장르·카테고리 신호를 추출하여 두 트랙(라이브러리 미플레이 / 위시리스트)으로 추천. **코사인 유사도**로 취향을 매칭해 태그가 많은 게임의 편향을 제거하고, **리뷰 호평률을 랭킹에 블렌딩**(0.65·취향 + 0.35·호평)하여 "취향 + 평 좋은 게임" 순으로 정렬하고 각 추천 카드에 호평률 배지 표시. 카드 농사용 단기 플레이는 사용자 조정 가능한 임계값으로 제외. 위시리스트 카드에 현재 가격을 표시하고 **할인 매력도를 블렌딩**(0.45·취향 + 0.30·호평 + 0.25·할인, "할인 중인 게임만" 필터 지원). 선택 시 **미보유 할인 게임 발굴** 트랙 — 스토어 할인 게임(리뷰순) 중 라이브러리·위시리스트에 없고 취향에 맞으며 리뷰 10개 이상인 게임을 추천 (첫 실행 1–2분 추가, 최대 120초 시간 예산). 가성비·할인만·추천 개수는 **서버 재분석 없이 즉시 재정렬**되고, 결과 섹션은 접고 펼 수 있음
 - **도전과제 대시보드** (`/achievements`) — 라이브러리 전체의 도전과제 달성 현황을 한 화면에 집계. SSE로 점진 스캔하며 진행률·요약(총 획득/완벽 달성/평균 달성률/최근 30일)을 실시간 표시하고, **남은 개수 순**(적은/많은) 등 다양한 정렬과 "완벽 달성 숨김" 필터를 제공. 게임 행을 펼치면 **과제별 전역 희귀도·획득 일시**를 보여주고(숨김 과제 스포일러 보호), **스키마 변경·완벽 달성 해제**를 감지해 알림 배너로 통지. 진행률은 영속되어 중단해도 재방문 시 이어서 스캔
-- **셀프호스팅 셋업 마법사** — 소스를 받아 각자 PC에서 실행할 때, `.env` 편집 없이 브라우저 `/setup` 화면에서 Steam API 키만 등록하면 됨 (SESSION_SECRET은 자동 생성). 배치 파일(`setup/build/start.bat`) 더블클릭으로 설치·빌드·실행
+- **번들 차트 메이커** (`/bundle`) — Steam 게임 번들을 게시판에 소개할 때, 각 게임의 썸네일·링크·현재가/정가/할인율(KRW)·호평률과 번들 총액·절약율을 표로 만들어 4포맷(SteamGifts 마크다운·BBCode·일반 마크다운·HTML)으로 클립보드 복사 또는 파일 다운로드. 3가지 입력: IsThereAnyDeal 최신 번들 목록 + Steam 패키지 전개 + 수동(스토어 URL·appID·이름 검색). 티어 구조(Humble "Beat the Average" 등) 편집 가능. **환율 변환**(무료 API, 12시간 캐시)으로 USD 등 번들 가격을 KRW로 환산해 병기하고 절약 %를 계산 · **자유 가격 메모** 직접 입력(ITAD가 주지 않는 스케줄 가격 등) · **불확실 매칭 "?" 표시**(이름 검색으로 찾은 게임) · **원문/미리보기 토글**(HTML 실제 렌더, 마크다운 근사) · 내용 오염 차단(HTML 링크는 새 탭, 마크다운 메타문자 이스케이프). ITAD API 키는 선택(무료, https://isthereanydeal.com/apps/my/) — 없으면 수동 입력·Steam 전개·복사·다운로드는 정상
+- **셀프호스팅 셋업 마법사** — 소스를 받아 각자 PC에서 실행할 때, `.env` 편집 없이 브라우저 `/setup` 화면에서 Steam API 키(및 선택적으로 ITAD API 키)를 등록하면 됨 (SESSION_SECRET은 자동 생성). 배치 파일(`setup/build/start.bat`) 더블클릭으로 설치·빌드·실행
 - **Steam 로그인** — Steam OpenID 로그인 또는 Steam ID 직접 입력
 - **SSE 점진적 로딩** — 게임별 리뷰가 병렬로 수집되어 실시간 스트리밍
 - **다양한 필터** — 언어, 기간, 플레이타임, 글자수, 추천/비추천, 무료 게임 제외
@@ -35,18 +36,19 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 | 캐시 | lru-cache (인메모리) + SQLite 영속 캐시 (게임 메타·추천 결과) |
 | 인증 | Steam OpenID |
 | 동영상 | hls.js (HLS 스트리밍) |
-| 테스트 | Vitest (257개 테스트) |
+| 테스트 | Vitest (556개 테스트) |
 | 배포 | Docker + GitLab CI/CD |
 
 ## 프로젝트 구조
 
 ```
 ├── app/
-│   ├── api/           # API 라우트 (auth, cache, reviews, search, wishlist, library, media, recommend, achievements, setup)
+│   ├── api/           # API 라우트 (auth, cache, reviews, search, wishlist, library, media, recommend, achievements, bundle, fx, setup)
 │   ├── feed/          # 통합 리뷰 피드 페이지
 │   ├── recommend/     # 성향 분석 + 추천 페이지
 │   ├── achievements/  # 도전과제 대시보드 페이지
-│   ├── setup/         # 최초 설정 마법사 (Steam API 키 등록)
+│   ├── bundle/        # 번들 차트 메이커 페이지
+│   ├── setup/         # 최초 설정 마법사 (Steam API 키 · 선택적 ITAD 키 등록)
 │   ├── game/[appId]/  # 게임별 리뷰 페이지 (+ 도전과제 요약 섹션)
 │   ├── privacy/       # 개인정보 처리방침
 │   ├── layout.tsx     # 루트 레이아웃 (ThemeProvider, FOUC 방지)
@@ -66,9 +68,13 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 │   ├── achievement-store.ts # 도전과제 영속 계층 (스키마/진행률/알림)
 │   ├── achievement-scan.ts # 도전과제 스캔 오케스트레이션
 │   ├── session.ts     # iron-session 세션 관리
+│   ├── bundle/        # 번들 차트 메이커 (타입, 포맷, 파싱, 합계)
+│   ├── itad/          # IsThereAnyDeal API 클라이언트 (최신 번들, UUID→appid 매핑)
+│   ├── fx.ts          # 환율 조회 (open.er-api.com, USD→KRW, 12시간 캐시)
+│   ├── env-file.ts    # .env.local upsert 유틸
 │   └── steam/         # Steam API 클라이언트, 타입, 정렬, 필터, 성향 분석(profile)
 ├── scripts/setup-env.mjs   # 최초 실행 .env.local 부트스트랩 (SESSION_SECRET 자동 생성)
-├── __tests__/         # 단위 테스트 (22파일 257개)
+├── __tests__/         # 단위 테스트 (38파일 556개)
 ├── middleware.ts       # 인증 미들웨어 (Edge Runtime)
 ├── Dockerfile
 ├── docker-compose.yml
@@ -84,6 +90,7 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
   - Windows에서 `setup.bat`을 실행하면 Node.js가 없을 경우 winget으로 자동 설치 가능
   - winget 직접 사용: `winget install OpenJS.NodeJS.LTS`
 - Steam Web API Key ([여기서 발급받기](https://steamcommunity.com/dev/apikey))
+- (선택) IsThereAnyDeal API Key ([여기서 발급받기](https://isthereanydeal.com/apps/my/)) — 번들 차트 메이커(`/bundle`)의 ITAD 번들 목록 조회에만 필요. 없어도 수동 입력·Steam 전개·복사는 정상 동작
 
 ### 빠른 시작 (Windows, 비개발자 권장)
 
@@ -97,6 +104,7 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 3. 브라우저에 뜨는 **설정 화면(`/setup`)**에서 [Steam API 키](https://steamcommunity.com/dev/apikey)를 붙여넣고 "저장하고 시작하기". 끝.
    - 키는 이 컴퓨터의 `.env.local`에만 저장되며, 저장 즉시 반영됩니다(재시작 불필요).
    - 키를 바꾸려면 `.env.local`의 `STEAM_API_KEY`를 직접 편집하세요.
+   - (선택) 같은 화면에서 [ITAD API 키](https://isthereanydeal.com/apps/my/)를 등록하면 번들 차트 메이커(`/bundle`)의 ITAD 번들 목록 조회를 쓸 수 있습니다. 없어도 나머지 기능은 정상 동작합니다.
 
 | 파일 | 동작 |
 |------|------|
@@ -104,6 +112,25 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 | `dev.bat` | 개발 서버 (`npm run dev`) |
 | `build.bat` | 프로덕션 빌드 (`npm run build`) |
 | `start.bat` | standalone 서버 실행 + 브라우저 자동 오픈 |
+
+### Steam API 키 발급 (처음이라면)
+
+위 3단계의 설정 화면에 붙여넣을 키를 발급하는 방법입니다.
+
+1. [steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey)에 접속해 Steam 계정으로 로그인합니다.
+2. "도메인 이름"에 아무 값이나 입력합니다(예: `localhost`). 약관에 동의하고 "등록"을 누릅니다.
+3. 화면에 표시되는 **32자리 키**를 복사해 `/setup` 화면에 붙여넣습니다.
+
+> (선택) 번들 차트 메이커의 ITAD 번들 목록까지 쓰려면 [isthereanydeal.com/apps/my](https://isthereanydeal.com/apps/my/)에서 앱을 등록해 ITAD 키를 발급받아 같은 `/setup` 화면에 추가로 등록하세요. 없어도 나머지 기능은 모두 동작합니다.
+
+### 실행 후 사용법
+
+`start.bat`을 실행하면 브라우저가 자동으로 열립니다(안 열리면 주소창에 `http://localhost:3000` 입력).
+
+1. **Steam 로그인** — "Steam으로 로그인"을 누르거나(OpenID) Steam ID를 직접 입력합니다. 위시리스트·라이브러리를 공개로 설정해 두어야 게임 목록을 읽을 수 있습니다.
+2. **리뷰 피드** — 위시리스트/라이브러리 게임의 최신 리뷰가 자동으로 수집·표시됩니다. 상단 탭(위시리스트 · 라이브러리 · 둘 다)과 필터(언어·기간·플레이타임·추천/비추천 등)로 범위를 조절합니다.
+3. **다른 기능** — 상단 메뉴에서 **성향 분석**(`/recommend`) · **도전과제**(`/achievements`) · **번들 차트**(`/bundle`)로 이동합니다. 번들 차트는 로그인 없이도 사용할 수 있습니다.
+4. **종료 / 재실행** — 열려 있는 `start.bat` 콘솔 창을 닫으면 서버가 멈춥니다. 다음부터는 `start.bat`만 다시 더블클릭하면 됩니다(설정·빌드는 최초 1회).
 
 ### 환경 변수 (수동 설정, 고급)
 
@@ -113,9 +140,10 @@ Steam 위시리스트/라이브러리 게임들의 최신 리뷰를 한 피드�
 STEAM_API_KEY=발급받은_API_키   # 비워 두면 첫 실행 시 /setup 화면에서 입력받음
 SESSION_SECRET=32자_이상_랜덤_문자열   # setup.bat/start.bat이 자동 생성
 NEXT_PUBLIC_BASE_URL=http://localhost:3000
+ITAD_API_KEY=   # 선택 (번들 차트 메이커), https://isthereanydeal.com/apps/my/ 에서 발급
 ```
 
-> `SESSION_SECRET`은 `node scripts/setup-env.mjs`가 자동 생성합니다. `STEAM_API_KEY`는 비워 두면 서버 첫 접속 시 `/setup` 페이지로 안내됩니다.
+> `SESSION_SECRET`은 `node scripts/setup-env.mjs`가 자동 생성합니다. `STEAM_API_KEY`는 비워 두면 서버 첫 접속 시 `/setup` 페이지로 안내됩니다. `ITAD_API_KEY`는 선택 사항입니다.
 
 ### 수동 실행 (npm)
 
@@ -164,6 +192,7 @@ Nginx 리버스 프록시가 필요하면 `docker-compose.yml`에서 nginx 서�
 | `SSH_USER` / `SSH_HOST` | 배포 서버 접속 정보 |
 | `STEAM_API_KEY` | Steam API 키 |
 | `SESSION_SECRET` | 세션 암호화 키 |
+| `ITAD_API_KEY` | (선택) IsThereAnyDeal API 키 — 번들 차트 메이커 ITAD 번들 목록 |
 | `NEXT_PUBLIC_BASE_URL` | 서비스 URL |
 
 파이프라인: `develop`/`main` push -> Docker 이미지 빌드 -> GitLab Registry push -> 수동 배포
@@ -187,15 +216,14 @@ Nginx 리버스 프록시가 필요하면 `docker-compose.yml`에서 nginx 서�
 **100개씩 한 번에** 받습니다. 한 번의 응답으로 장르(장르 태그)·카테고리·출시 여부·헤더 이미지·
 리뷰 요약·가격을 함께 받아, 메타·위시 가격·리뷰 호평률 조회가 같은 캐시를 공유합니다.
 
-- 속도: 호출당 약 0.3초, 호출 사이 0.5초 간격. 미캐시 5,000개 라이브러리도 1분 안팎
-  (이전 `appdetails` 게임당 1.5초 직렬 방식은 같은 규모에 약 2시간).
-- 트래픽: 필요한 필드만 요청해 게임당 약 2–3KB (`appdetails`는 20KB 이상).
+- 속도: 호출당 약 0.3초, 호출 사이 0.5초 간격. 미캐시 5,000개 라이브러리도 1분 안팎.
+- 트래픽: 필요한 필드만 요청해 게임당 약 2–3KB.
 - 장르는 게임의 상위 사용자 태그 중 Steam 장르 태그(액션·RPG 등)로 정합니다. 카테고리 이름은
   `GetStoreCategories`(한국어)로 붙입니다.
 - 가격: 단일 게임 구매 옵션의 가격만 씁니다(묶음 패키지 가격 제외). 최저 옵션이 묶음뿐인 위시 게임은
   단품 가격을 `appdetails`로 보충합니다(store 429 backoff 중이면 생략). 100% 할인 배포(한정 무료)는
   무료 게임(F2P)으로 보지 않습니다. 가격 조회가 실패하면 24시간 이내 마지막 가격을 회색으로 표시합니다.
-- 할인 발굴의 후보 목록(검색 페이지)과 게임 상세 화면의 가격 재조회는 여전히 store 호스트를 씁니다.
+- 할인 발굴의 후보 목록(검색 페이지)과 게임 상세 화면의 가격 재조회는 store 호스트를 씁니다.
 
 ### 캐시
 

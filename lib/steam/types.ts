@@ -195,7 +195,21 @@ export interface SteamStoreBrowseItem {
     /** 세트로만 구매 가능한 옵션. */
     must_purchase_as_set?: boolean;
   };
+  /**
+   * 번들/패키지 전개 시 포함된 appid (include_included_items 요청 시).
+   * 단계 0 V3b 실측(2026-10-12, bundleid 232 등): `included_appids`는 appid 정수 배열,
+   * `included_items.included_apps[]`는 각 포함 게임 상세(appid 포함). expandSteamCollection은
+   * included_appids를 우선 쓰고 included_apps로 보강한다. 둘 다 없으면 [].
+   */
+  included_appids?: number[];
+  included_items?: { included_apps?: { appid?: number }[] };
 }
+
+/**
+ * GetItems `input.ids` 원소. appid 외에 packageid(패키지=sub)·bundleid(스토어 번들) 전개에 쓴다.
+ * fetchStoreItemsByRef가 그대로 전달한다 (작업 지시서 20261012_01 단계 1-2 C1).
+ */
+export type StoreItemRef = { appid: number } | { packageid: number } | { bundleid: number };
 
 export interface SteamStoreBrowseResponse {
   response?: { store_items?: SteamStoreBrowseItem[] };

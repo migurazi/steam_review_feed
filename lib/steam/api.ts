@@ -26,11 +26,12 @@ import {
   STORE_ITEMS_BATCH_SIZE,
 } from "@/lib/constants";
 import { parseSearchResultAppIds, countSearchResultRows, normalizeStoreItem } from "./deals";
+import { steamStoreUrl } from "@/lib/bundle/parse";
 import { setAppMeta, setAppMetaBatch, setAppMetaFromStoreBatch } from "@/lib/app-meta-cache";
 import { getAppDetailsFromStore, setAppDetailsInStore } from "@/lib/app-details-store";
 import { computeSchemaHash } from "@/lib/achievement-diff";
 import { getStoreMetaFromStore, getStoreMetaIdsInStore, setStoreMetaInStore } from "@/lib/store-meta-store";
-import { storeItemToAppDetails, storeItemPriceIsAppPrice, STORE_META_DATA_REQUEST } from "./store-meta";
+import { storeItemToAppDetails, storeItemPriceIsAppPrice, storeItemHeaderImage, STORE_META_DATA_REQUEST } from "./store-meta";
 import { getGlobalFromStore, setGlobalInStore } from "@/lib/achievement-store";
 import type {
   SteamWishlistItem,
@@ -46,6 +47,7 @@ import type {
   SteamFeaturedCategoriesResponse,
   SteamStoreBrowseResponse,
   SteamStoreBrowseItem,
+  StoreItemRef,
   StoreItemSummary,
   SteamReview,
   SteamReviewsResponse,
@@ -59,6 +61,7 @@ import type {
   SteamPlayerAchievementsResponse,
   SteamGlobalPercentagesResponse,
 } from "./types";
+import type { GameRow, GameRowPrice } from "@/lib/bundle/types";
 
 const STEAM_API_BASE = "https://api.steampowered.com";
 const STEAM_STORE_BASE = "https://store.steampowered.com";
@@ -1082,16 +1085,21 @@ function recordStoreItemPrice(
 
 /**
  * IStoreBrowseService/GetItems 한 번 호출 (KR 컨텍스트, 최대 STORE_ITEMS_BATCH_SIZE개).
- * getStoreItemsBatch·getStoreMetaBatch 공용 — 요청 URL 조립과 "요청하지 않은 appid 무시" 규칙을 한곳에 둔다.
+ * refs는 `{appid}`·`{packageid}`·`{bundleid}`를 섞어 보낼 수 있다(패키지/번들 전개용).
  *
- * @returns 요청한 appid → 원본 store_item (응답에 있는 것만, success 값 무관). 호출 실패면 null.
+ * @returns 응답 store_items 배열 (success 값 무관). 호출 실패면 [].
+ *   filterToRequested(기본 true)이고 refs가 모두 {appid}면 기존처럼 요청한 appid만 남긴다.
+ *   그 외(packageid/bundleid 전개 — 응답에 요청 외 appid가 포함됨)는 전체를 그대로 반환한다.
+ * (작업 지시서 20261012_01 단계 1-2 C1)
  */
-async function fetchStoreItems(
-  ids: readonly number[],
+async function fetchStoreItemsByRef(
+  refs: readonly StoreItemRef[],
   dataRequest: Record<string, unknown>,
-): Promise<Map<number, SteamStoreBrowseItem> | null> {
+  opts: { filterToRequested?: boolean } = {},
+): Promise<SteamStoreBrowseItem[]> {
+  const filterToRequested = opts.filterToRequested ?? true;
   const input = {
-    ids: ids.map(appid => ({ appid })),
+    ids: refs,
     // KR 고정: storeItemToPrice가 통화를 KRW로 기록하는 전제.
     context: { language: "koreana", country_code: "KR" },
     data_request: dataRequest,
@@ -1101,7 +1109,34 @@ async function fetchStoreItems(
     `?input_json=${encodeURIComponent(JSON.stringify(input))}`;
   const res = await fetchJson<SteamStoreBrowseResponse>(url);
   const items = res?.response?.store_items;
-  if (!Array.isArray(items)) return null;
+  if (!Array.isArray(items)) return [];
+  // refs가 모두 appid일 때만 요청 외 appid를 버린다 — 전개(package/bundle)는 요청 외 appid가 정상 결과다.
+  const appidRefs = refs.every((r): r is { appid: number } => "appid" in r);
+  if (!filterToRequested || !appidRefs) return items;
+  const requested = new Set(appidRefs ? refs.map(r => (r as { appid: number }).appid) : []);
+  return items.filter(raw => {
+    const appid = raw.appid ?? raw.id;
+    return typeof appid === "number" && requested.has(appid);
+  });
+}
+
+/**
+ * IStoreBrowseService/GetItems 한 번 호출 — appid만 요청하는 기존 호출부(getStoreItemsBatch·
+ * getStoreMetaBatch·getStoreItemPricesBatch)의 계약(Map 반환)을 유지한다. 내부는 fetchStoreItemsByRef.
+ *
+ * @returns 요청한 appid → 원본 store_item (응답에 있는 것만, success 값 무관). 호출 실패·빈 응답이면
+ *   빈 Map. (기존 구현의 null 반환과 호출부 동작은 같다 — 세 호출부 모두 `items ?? []`로 순회해
+ *   null·빈 Map을 같게 취급한다.)
+ */
+async function fetchStoreItems(
+  ids: readonly number[],
+  dataRequest: Record<string, unknown>,
+): Promise<Map<number, SteamStoreBrowseItem> | null> {
+  const items = await fetchStoreItemsByRef(
+    ids.map(appid => ({ appid })),
+    dataRequest,
+    { filterToRequested: true },
+  );
   const requested = new Set(ids);
   const out = new Map<number, SteamStoreBrowseItem>();
   for (const raw of items) {
@@ -1449,6 +1484,175 @@ export async function getStoreItemPricesBatch(
     if (stale && now - stale.fetchedAt <= PRICE_STALE_FALLBACK_MAX_AGE_MS) result.set(id, { ...stale, fallback: true });
   }
   return result;
+}
+
+// ============================================================================
+// 번들 차트 메이커 보강 (작업 지시서 20261012_01 단계 1-2)
+// ============================================================================
+
+/**
+ * SteamPriceOverview(GetItems·appdetails, cents·KRW)를 번들 차트의 GameRowPrice로 매핑한다.
+ * fallback은 호출 측이 PriceSnapshot.fallback으로 세팅한다.
+ *
+ * initialFormatted는 무할인 응답에서 initial_formatted가 빈 문자열이므로 final_formatted로 폴백한다
+ * (정가 == 최종가라 표시가 같다).
+ */
+export function toGameRowPrice(p: SteamPriceOverview): GameRowPrice {
+  return {
+    currency: p.currency,
+    initial: p.initial,
+    final: p.final,
+    discountPercent: p.discount_percent,
+    initialFormatted: p.initial_formatted || p.final_formatted,
+    finalFormatted: p.final_formatted,
+  };
+}
+
+/**
+ * getBundleGameRows의 GetItems data_request. 이름·헤더(assets)·리뷰 요약만 받아 응답을 작게 유지한다
+ * (단계 0 V4). 가격은 getStoreItemPricesBatch가 따로 받으므로 여기서 받지 않는다.
+ */
+export const BUNDLE_ROW_DATA_REQUEST = {
+  include_assets: true,
+  include_reviews: true,
+} as const;
+
+/**
+ * 번들 차트용 게임 행을 만든다 (입력 순서 보존, 중복 appid 제거).
+ *
+ *   - 가격: getStoreItemPricesBatch 재사용(묶음전용→appdetails 보충·last-known fallback 포함, M4).
+ *   - 이름/헤더/리뷰: fetchStoreItemsByRef(BUNDLE_ROW_DATA_REQUEST)로 100개씩. seedReviewSummary도 채운다.
+ *   - headerImage는 http/https 스킴일 때만 사용(M7), 아니면 "".
+ *   - price/priceUnknown 분기(단계 1-2):
+ *       · snapshot.price 있으면 toGameRowPrice + fallback.
+ *       · snapshot 있고 price===null → 무료/미판매 확인(price:null, priceUnknown:false).
+ *       · 맵에 snapshot 없음(조회 실패) → price:null, priceUnknown:true(미상).
+ */
+export async function getBundleGameRows(appIds: number[]): Promise<GameRow[]> {
+  const uniqueIds = Array.from(new Set(appIds));
+  if (uniqueIds.length === 0) return [];
+
+  // 가격: 묶음전용→appdetails 보충·fallback 재사용.
+  const prices = await getStoreItemPricesBatch(uniqueIds);
+
+  // 이름·헤더·리뷰: 100개씩.
+  const raws = new Map<number, SteamStoreBrowseItem>();
+  for (let i = 0; i < uniqueIds.length; i += STORE_ITEMS_BATCH_SIZE) {
+    if (i > 0) await delay(STEAM_API_DELAY.reviews);
+    const batch = uniqueIds.slice(i, i + STORE_ITEMS_BATCH_SIZE);
+    const items = await fetchStoreItemsByRef(
+      batch.map(appid => ({ appid })),
+      BUNDLE_ROW_DATA_REQUEST,
+      { filterToRequested: true },
+    );
+    const now = Date.now();
+    for (const raw of items) {
+      const appid = raw.appid ?? raw.id;
+      if (typeof appid !== "number" || !batch.includes(appid)) continue;
+      raws.set(appid, raw);
+      // 같은 응답의 리뷰 요약을 캐시에도 채운다 (getStoreItemsBatch와 같은 의도).
+      seedReviewSummary(appid, normalizeStoreItem(raw, now)?.review ?? null);
+    }
+  }
+
+  const now = Date.now();
+  return uniqueIds.map(appId => {
+    const raw = raws.get(appId);
+    const snapshot = prices.get(appId);
+
+    const name = raw?.name ?? `AppID ${appId}`;
+    const header = raw ? storeItemHeaderImage(raw) : undefined;
+    const headerImage = header && /^https?:\/\//i.test(header) ? header : "";
+
+    // 리뷰: totalReviews 0이면 null.
+    const summary = raw ? normalizeStoreItem(raw, now) : null;
+    const r = summary?.review ?? null;
+    const review =
+      r && r.totalReviews > 0
+        ? {
+            positivePercent: Math.round((100 * r.totalPositive) / r.totalReviews),
+            total: r.totalReviews,
+            desc: r.reviewScoreDesc,
+          }
+        : null;
+
+    // 가격/미상 분기.
+    let price: GameRowPrice | null = null;
+    let priceUnknown = false;
+    if (snapshot) {
+      if (snapshot.price) {
+        price = toGameRowPrice(snapshot.price);
+        if (snapshot.fallback) price.fallback = true;
+      }
+      // snapshot 있고 price===null → 무료/미판매 확인 (priceUnknown=false, price=null).
+    } else {
+      // 맵에 없음 = 조회 실패(미상).
+      priceUnknown = true;
+    }
+
+    const row: GameRow = {
+      appId,
+      name,
+      headerImage,
+      storeUrl: steamStoreUrl(appId),
+      type: "game",
+      price,
+      review,
+    };
+    if (priceUnknown) row.priceUnknown = true;
+    return row;
+  });
+}
+
+/** packagedetails 응답 중 사용하는 필드만 (data.apps[].id). */
+interface SteamPackageDetailsResponse {
+  [packageId: string]: { success?: boolean; data?: { apps?: { id?: number }[] } };
+}
+
+/**
+ * Steam 패키지(sub)·스토어 번들을 포함 appid 배열로 전개한다 (작업 지시서 20261012_01 단계 1-2).
+ *
+ *   - package: store.steampowered.com/api/packagedetails?packageids={id}&cc=KR&l=koreana 의 data.apps[].id.
+ *     store 호스트라 기존 appDetails 딜레이·공유 backoff를 존중한다.
+ *   - bundle: fetchStoreItemsByRef([{bundleid:id}], {include_included_items:true})의 included_appids /
+ *     included_items.items[].appid. 둘 다 없으면 [](V3b 미지원 — 호출 측이 "번들 전개 미지원" 안내).
+ *
+ * 어느 경우든 실패하면 [].
+ */
+export async function expandSteamCollection(
+  kind: "package" | "bundle",
+  id: number,
+): Promise<number[]> {
+  if (kind === "package") {
+    await delay(STEAM_API_DELAY.appDetails);
+    await appDetailsBackoffDelay();
+    const url =
+      `${STEAM_STORE_BASE}/api/packagedetails?packageids=${id}&cc=KR&l=koreana`;
+    const res = await fetchJson<SteamPackageDetailsResponse>(url);
+    const apps = res?.[String(id)]?.data?.apps;
+    if (!Array.isArray(apps)) return [];
+    const out: number[] = [];
+    for (const a of apps) {
+      if (typeof a?.id === "number" && a.id > 0) out.push(a.id);
+    }
+    return out;
+  }
+  // bundle
+  const items = await fetchStoreItemsByRef(
+    [{ bundleid: id }],
+    { include_included_items: true },
+    { filterToRequested: false },
+  );
+  const out = new Set<number>();
+  for (const raw of items) {
+    for (const appid of raw.included_appids ?? []) {
+      if (typeof appid === "number" && appid > 0) out.add(appid);
+    }
+    for (const it of raw.included_items?.included_apps ?? []) {
+      if (typeof it?.appid === "number" && it.appid > 0) out.add(it.appid);
+    }
+  }
+  return Array.from(out);
 }
 
 /**

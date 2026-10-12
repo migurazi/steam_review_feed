@@ -125,6 +125,30 @@ export const DISCOVER_TIME_BUDGET_MS = 120_000;
 export const STORE_ITEMS_BATCH_SIZE = 100;
 
 /**
+ * 번들 차트 메이커(ITAD) 상수 (작업 지시서 20261012_01 단계 1-1).
+ *   - ITAD_BUNDLE_SCAN_PAGES:    by-id 엔드포인트 부재 → findBundle이 번들 목록을 스캔할 최대 페이지 수
+ *                                (limit 50 × 4p ≈ 200건). 못 찾으면 미스 음성 캐시 후 조용한 상한 대신 로그.
+ *   - ITAD_LIST_CACHE_TTL_MS:    getRecentBundles 목록 캐시 (10분).
+ *   - ITAD_BUNDLE_CACHE_TTL_MS:  findBundle 발견분 캐시 (60분).
+ *   - ITAD_BUNDLE_MISS_TTL_MS:   findBundle 미스 음성 캐시 (10분 — 재스캔 억제).
+ *   - ITAD_APPID_CACHE_TTL_MS:   lookupSteamAppIds UUID→appid 개별 캐시 (7일, 음성 0 포함).
+ *   - BUNDLE_INPUT_MAX_IDS:      수동/번들 입력 배열 길이 상한 (익명 남용 방어).
+ */
+export const ITAD_BUNDLE_SCAN_PAGES = 4;
+export const ITAD_LIST_CACHE_TTL_MS = 10 * 60 * 1000;
+export const ITAD_BUNDLE_CACHE_TTL_MS = 60 * 60 * 1000;
+export const ITAD_BUNDLE_MISS_TTL_MS = 10 * 60 * 1000;
+export const ITAD_APPID_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const BUNDLE_INPUT_MAX_IDS = 100;
+
+/**
+ * 패키지+번들 전개 대상 상한 (익명 남용 방어). /api/bundle/resolve에서 전개할 패키지·번들 URL의
+ * 합계가 이 값을 넘으면 거부한다 — 전개 1건당 직렬 Steam 호출이 따르므로 요청당 호출량을 묶는다.
+ * (appid 직접 입력은 전개가 없어 BUNDLE_INPUT_MAX_IDS 상한만 적용.)
+ */
+export const BUNDLE_EXPAND_MAX_COLLECTIONS = 10;
+
+/**
  * 필터 기본값.
  * FilterPanel의 DEFAULT_FILTERS와 서버 측 DEFAULTS를 통합한다.
  */

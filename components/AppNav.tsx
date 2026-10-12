@@ -1,13 +1,14 @@
 import Link from 'next/link';
 
 interface AppNavProps {
-  current: 'feed' | 'recommend' | 'achievements';
+  current: 'feed' | 'recommend' | 'achievements' | 'bundle';
 }
 
 const NAV_ITEMS = [
   { key: 'feed' as const, label: '리뷰 피드', href: '/feed' },
   { key: 'recommend' as const, label: '성향 분석', href: '/recommend' },
   { key: 'achievements' as const, label: '도전과제', href: '/achievements' },
+  { key: 'bundle' as const, label: '번들 차트', href: '/bundle' },
 ] as const;
 
 export default function AppNav({ current }: AppNavProps) {

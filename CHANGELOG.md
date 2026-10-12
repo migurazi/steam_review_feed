@@ -7,6 +7,18 @@
 
 ### Added
 
+- **번들 차트 메이커** (`/bundle`) — Steam 게임 번들을 게시판에 소개할 표 생성 도구
+  - 3가지 입력: IsThereAnyDeal 최신 번들 목록 조회·필터·선택 / ITAD 번들 URL 붙여넣기 / 수동 입력(스토어 URL·appID·이름 검색 + Steam 패키지/번들 전개)
+  - 4포맷 출력: SteamGifts 마크다운 · BBCode · 일반 마크다운 · HTML (각각 클립보드 복사·파일 다운로드·원문/미리보기 토글)
+  - 게임 행: 썸네일 · 게임명(스토어 링크) · 현재가/정가/할인율(KRW) · 호평률 배지 · DLC 표시 · 불확실 매칭 "?" 표시
+  - 티어 구조 편집(Humble "Beat the Average" 등): 추가/삭제/이름/가격 규칙(정가 합·고정가·N개 선택·N% 할인) · 게임 이동
+  - 환율 변환(신규): 무료 API(open.er-api.com, base USD, 12시간 캐시)로 번들 가격 USD→KRW 환산하여 "지불 $27.00 (≈₩36,200)" 병기 · 절약 % 계산 · 환산 불가 시 degrade
+  - 자유 가격 메모(신규): ITAD가 주지 않는 가격(예: Fanatical 품목당 단가 스케줄) 직접 입력 → 출력 상단 표기
+  - HTML 출력: 링크는 새 탭(`target=_blank`), `<table border="1">` 저장 시에도 테두리 표시 · 마크다운/SG/BBCode는 제목·게임명 메타문자 이스케이프
+  - 미보유 미매칭 수습: ITAD UUID→Steam appid 매핑 실패분을 이름 검색으로 보강해 원래 티어에 삽입
+  - ITAD API 키 선택(무료, https://isthereanydeal.com/apps/my/): 없으면 ITAD 목록 기능 비활성, 수동·Steam 전개·복사·다운로드는 정상
+  - 공개 페이지: 비로그인 사용 가능 · 로그인 시 헤더 프로필·로그아웃 표시
+  - 보안/견고성: 공개 라우트 입력 상한(배열 ≤100, 전개 대상 ≤10) · ITAD rate limit + outbound 예산 가드 · 미스 음성 캐시 · `.env.local` 쓰기 시 개행 주입 차단 · ITAD 키 형식 검증
 - **성향 분석 + 보유 게임 추천** (`/recommend`) — 라이브러리 플레이타임 분포에서
   장르·카테고리 신호를 추출하여 두 트랙으로 추천
   - 트랙 A: 라이브러리에 있지만 안 해본 게임 (`classify`가 'unplayed'로 분류한 후보)
@@ -58,6 +70,7 @@
 
 ### Changed
 
+- **상단 네비게이션 통일**: 모든 페이지(`/feed` · `/recommend` · `/achievements` · `/bundle`)가 공용 `AppNav` 사용
 - **성향 분석 메타 조회를 GetItems 배치로 전환** — 게임마다 `appdetails`(store 호스트, 1.5초
   직렬)를 부르던 것을 `IStoreBrowseService/GetItems` 100개/호출로 교체 (`getStoreMetaBatch`).
   미캐시 5,000개 라이브러리 첫 분석 약 2시간 → 1분 안팎, 게임당 응답 20KB+ → 2–3KB
@@ -100,6 +113,8 @@
 
 ### Notes
 
+- `/bundle` 환율 API는 외부 서비스(open.er-api.com) 의존 — 조회 실패 시 graceful degrade
+- ITAD API 키는 선택(무료, 발급 신청 필요) — 없으면 번들 목록 기능만 비활성, 수동 입력·다운로드는 정상
 - `W_CAT` 기본값은 단계 0 사전 측정 결과(장르 엔트로피 2.962 ≥ 2.5)에 따라
   조정 룰 적용으로 0.5 → **0.3** 하향. 자세한 측정 데이터는 작업 지시서
   부록 A (`docs/20260527_01_profile_analysis_recommendation.md`) 참조.

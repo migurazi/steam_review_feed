@@ -19,6 +19,7 @@ import FilterPanel, { FilterState } from '@/components/FilterPanel';
 import ReviewFeed from '@/components/ReviewFeed';
 import GameSearch from '@/components/GameSearch';
 import ThemeToggle from '@/components/ThemeToggle';
+import AppNav from '@/components/AppNav';
 import AppFooter from '@/components/AppFooter';
 import { parseFiltersFromParams, filtersToParams, saveFiltersToStorage, loadFiltersFromStorage } from '@/lib/filter-params';
 
@@ -120,70 +121,61 @@ function FeedPageContent() {
     <div className="min-h-screen flex flex-col">
       {/* Header */}
       <header className="sticky top-0 z-40 bg-white/95 dark:bg-gray-900/95 backdrop-blur border-b border-gray-200 dark:border-gray-800 px-4 py-3">
-        <div className="max-w-5xl mx-auto flex items-center justify-between gap-4">
-          <Link href="/" className="text-[#1b6fa8] dark:text-[#66c0f4] font-bold text-base shrink-0">
-            Steam Review Feed
-          </Link>
-
-          {/* Source tabs */}
-          <div className="flex bg-gray-100 dark:bg-gray-800 rounded-lg p-1 gap-1">
-            {tabs.map((tab) => (
+        <div className="max-w-5xl mx-auto space-y-2.5">
+          {/* 1줄: 브랜드 + 전역 네비 + 계정 (다른 페이지와 동일한 logo | AppNav | 계정 3분할) */}
+          <div className="flex items-center justify-between gap-4 flex-wrap">
+            <Link href="/" className="text-[#1b6fa8] dark:text-[#66c0f4] font-bold text-base shrink-0">
+              Steam Review Feed
+            </Link>
+            <AppNav current="feed" />
+            <div className="flex items-center gap-3">
+              {steamId && (
+                <a
+                  href={`https://steamcommunity.com/profiles/${steamId}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hidden sm:flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] transition-colors"
+                  title={steamId}
+                >
+                  {avatarUrl && (
+                    <img src={avatarUrl} alt="" className="w-6 h-6 rounded-full" />
+                  )}
+                  <span className="truncate max-w-[120px]">{displayName || steamId}</span>
+                </a>
+              )}
+              <ThemeToggle />
               <button
-                key={tab.value}
                 type="button"
-                onClick={() => handleSourceChange(tab.value)}
-                className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
-                  filters.source === tab.value
-                    ? 'bg-white dark:bg-[#1b2838] text-[#1b6fa8] dark:text-[#66c0f4] border border-gray-300 dark:border-[#4c6b8a] shadow-sm'
-                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
-                }`}
+                onClick={handleLogout}
+                disabled={loggingOut}
+                className="px-3 py-1.5 text-sm text-gray-500 dark:text-gray-400 border border-gray-300 dark:border-gray-700 rounded-lg hover:text-gray-700 dark:hover:text-gray-200 hover:border-gray-400 dark:hover:border-gray-600 transition-colors disabled:opacity-50"
               >
-                {tab.label}
+                {loggingOut ? '...' : '로그아웃'}
               </button>
-            ))}
+            </div>
           </div>
 
-          <div className="flex items-center gap-3">
-            <Link
-              href="/recommend"
-              className="hidden sm:inline text-sm text-gray-500 dark:text-gray-400 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] transition-colors"
-              title="보유 게임 성향 분석 + 추천"
-            >
-              성향 분석
-            </Link>
-            <Link
-              href="/achievements"
-              className="hidden sm:inline text-sm text-gray-500 dark:text-gray-400 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] transition-colors"
-              title="라이브러리 도전과제 달성 현황"
-            >
-              도전과제
-            </Link>
-            <div className="hidden sm:block w-48">
+          {/* 2줄: 피드 전용 — 소스 탭 + 게임 검색 */}
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex bg-gray-100 dark:bg-gray-800 rounded-lg p-1 gap-1">
+              {tabs.map((tab) => (
+                <button
+                  key={tab.value}
+                  type="button"
+                  onClick={() => handleSourceChange(tab.value)}
+                  className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
+                    filters.source === tab.value
+                      ? 'bg-white dark:bg-[#1b2838] text-[#1b6fa8] dark:text-[#66c0f4] border border-gray-300 dark:border-[#4c6b8a] shadow-sm'
+                      : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+            <div className="w-full sm:w-64 max-w-xs">
               <GameSearch />
             </div>
-            {steamId && (
-              <a
-                href={`https://steamcommunity.com/profiles/${steamId}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="hidden sm:flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400 hover:text-[#1b6fa8] dark:hover:text-[#66c0f4] transition-colors"
-                title={steamId}
-              >
-                {avatarUrl && (
-                  <img src={avatarUrl} alt="" className="w-6 h-6 rounded-full" />
-                )}
-                <span className="truncate max-w-[120px]">{displayName || steamId}</span>
-              </a>
-            )}
-            <ThemeToggle />
-            <button
-              type="button"
-              onClick={handleLogout}
-              disabled={loggingOut}
-              className="px-3 py-1.5 text-sm text-gray-500 dark:text-gray-400 border border-gray-300 dark:border-gray-700 rounded-lg hover:text-gray-700 dark:hover:text-gray-200 hover:border-gray-400 dark:hover:border-gray-600 transition-colors disabled:opacity-50"
-            >
-              {loggingOut ? '...' : '로그아웃'}
-            </button>
           </div>
         </div>
       </header>
